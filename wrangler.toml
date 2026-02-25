@@ -1,9 +1,9 @@
-name = "spectux-api"
+name = "spectuxportal"
 main = "index.ts"
 compatibility_date = "2026-02-25"
 
 # Dit is de koppeling met je D1 Database
 [[d1_databases]]
 binding = "DB"
-database_name = "klantenportaalspectux" # Vervang dit door de naam van jouw database
-database_id = "5b3f54a4-0633-48d3-b86d-91bc97de9896" # Vervang dit door jouw database ID
+database_name = "klantenportaalspectux"
+database_id = "5b3f54a4-0633-48d3-b86d-91bc97de9896"
