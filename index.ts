@@ -28,7 +28,7 @@ async function sendEmail(apiKey, to, subject, html) {
 
 // --- CORS & RESPONSE HELPER ---
 function getCorsHeaders(request) {
-  const allowedOrigins = ['http://localhost:5173', 'https://spectux.com', 'https://www.spectux.com'];
+  const allowedOrigins = ['http://localhost:8080', 'https://spectux.com', 'https://www.spectux.com'];
   const origin = request.headers.get('Origin');
   const isAllowed = allowedOrigins.includes(origin);
 
