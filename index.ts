@@ -54,7 +54,7 @@ export default {
       // 0. PORTAL ADMIN ROUTES (eigen secret)
       // ==========================================
       if (path.startsWith('/api/portal-admin/')) {
-        // Authorization header gebruiken (geen custom header = geen CORS problemen)
+        // FIX: Authorization: Bearer header uitlezen (consistent met de frontend)
         const authHeader = request.headers.get('Authorization') || '';
         const adminSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
         const expectedSecret = (env.ADMIN_SECRET || '').trim();
@@ -212,12 +212,12 @@ export default {
       // ==========================================
       const authHeader = request.headers.get("Authorization");
       if (!authHeader?.startsWith("Bearer ")) {
-        return jsonResponse({ error: 'Niet geautoriseerd', received_len: adminSecret.length, expected_len: expectedSecret.length }, 401, request);
+        return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
       }
       const userId = authHeader.split(" ")[1];
 
       const userRecord = await env.DB.prepare('SELECT id, plan_factuur FROM users WHERE id = ?').bind(userId).first();
-      if (!userRecord) return jsonResponse({ error: 'Niet geautoriseerd', received_len: adminSecret.length, expected_len: expectedSecret.length }, 401, request);
+      if (!userRecord) return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
 
       // --- DASHBOARD ---
       if (request.method === "GET" && path === "/api/dashboard") {
