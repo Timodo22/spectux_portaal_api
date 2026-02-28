@@ -1,4 +1,12 @@
-// --- HULPFUNCTIES ---
+// ==========================================
+// SPECTUX PORTAAL WORKER
+// ==========================================
+// Nieuw in deze versie:
+//   POST /api/auth/check-email          → checkt of een email al bestaat
+//   POST /api/internal/activate-plan    → intern endpoint (INTERNAL_SECRET)
+//                                          maakt account aan of activeert plan_factuur
+// ==========================================
+
 const generateCode = () => Math.floor(100000 + Math.random() * 900000).toString();
 
 async function hashPassword(password) {
@@ -26,7 +34,7 @@ function getCorsHeaders(request) {
   return {
     "Access-Control-Allow-Origin": allowedOrigins.includes(origin) ? origin : "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Secret",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Secret, X-Internal-Secret",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -38,7 +46,6 @@ function jsonResponse(body, status, request) {
   });
 }
 
-// --- MAIN WORKER ---
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
@@ -51,19 +58,17 @@ export default {
     try {
 
       // ==========================================
-      // 0. PORTAL ADMIN ROUTES (eigen secret)
+      // 0. PORTAL ADMIN ROUTES
       // ==========================================
       if (path.startsWith('/api/portal-admin/')) {
-        // FIX: Authorization: Bearer header uitlezen (consistent met de frontend)
         const authHeader = request.headers.get('Authorization') || '';
         const adminSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
         const expectedSecret = (env.ADMIN_SECRET || '').trim();
 
         if (!adminSecret || adminSecret !== expectedSecret) {
-          return jsonResponse({ error: 'Niet geautoriseerd', received_len: adminSecret.length, expected_len: expectedSecret.length }, 401, request);
+          return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
         }
 
-        // Alle gebruikers ophalen
         if (path === '/api/portal-admin/users' && request.method === 'GET') {
           const { results: users } = await env.DB.prepare(
             'SELECT id, name, email, is_verified, plan_factuur, plan_planner, created_at FROM users ORDER BY created_at DESC'
@@ -84,7 +89,6 @@ export default {
           return jsonResponse({ users: usersWithStats }, 200, request);
         }
 
-        // Statistieken
         if (path === '/api/portal-admin/stats' && request.method === 'GET') {
           const userCount = await env.DB.prepare('SELECT COUNT(*) as count FROM users').first();
           const verifiedCount = await env.DB.prepare('SELECT COUNT(*) as count FROM users WHERE is_verified = 1').first();
@@ -107,7 +111,6 @@ export default {
           }, 200, request);
         }
 
-        // Alle facturen ophalen (met gebruikersinfo)
         if (path === '/api/portal-admin/invoices' && request.method === 'GET') {
           const { results: invoices } = await env.DB.prepare(
             `SELECT i.id, i.invoice_number, i.issue_date, i.status, i.customer_name, i.total, i.subtotal, i.vat_total,
@@ -119,7 +122,6 @@ export default {
           return jsonResponse({ invoices }, 200, request);
         }
 
-        // Premium toggle
         if (path.match(/^\/api\/portal-admin\/users\/[^/]+\/toggle-premium$/) && request.method === 'POST') {
           const userId = path.split('/')[4];
           const { plan_factuur } = await request.json();
@@ -127,7 +129,6 @@ export default {
           return jsonResponse({ message: 'Plan bijgewerkt' }, 200, request);
         }
 
-        // Gebruiker verwijderen (incl. alle data)
         if (path.match(/^\/api\/portal-admin\/users\/[^/]+$/) && request.method === 'DELETE') {
           const userId = path.split('/')[4];
           await env.DB.prepare('DELETE FROM invoices WHERE user_id = ?').bind(userId).run();
@@ -141,14 +142,93 @@ export default {
       }
 
       // ==========================================
+      // INTERN ENDPOINT — Aangeroepen door pricing worker na betaling
+      // Beveiligd met INTERNAL_SECRET (aparte env variabele, NIET de admin secret)
+      // ==========================================
+      if (path === '/api/internal/activate-plan' && request.method === 'POST') {
+        const internalSecret = request.headers.get('X-Internal-Secret') || '';
+        if (!internalSecret || internalSecret !== (env.INTERNAL_SECRET || '')) {
+          return jsonResponse({ error: 'Intern endpoint: toegang geweigerd' }, 401, request);
+        }
+
+        const { email, name, password_hash, is_new_user, plan } = await request.json();
+        const normalizedEmail = email.toLowerCase().trim();
+
+        const existingUser = await env.DB.prepare('SELECT id, plan_factuur FROM users WHERE email = ?').bind(normalizedEmail).first();
+
+        if (existingUser) {
+          // Bestaande gebruiker: zet plan_factuur op 1
+          await env.DB.prepare('UPDATE users SET plan_factuur = 1 WHERE id = ?').bind(existingUser.id).run();
+
+          // Stuur bevestigingsmail
+          await sendEmail(
+            env.RESEND_API_KEY,
+            normalizedEmail,
+            'Spectux Factuur Tool geactiveerd!',
+            `<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#333">
+              <h2 style="color:#4f46e5">Factuur Tool geactiveerd 🎉</h2>
+              <p>Geweldig, je Spectux Factuur Tool is geactiveerd!</p>
+              <p>Log in op je bestaande account om direct te beginnen:</p>
+              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">
+                Open Portaal
+              </a>
+              <p style="color:#888;font-size:13px">Vragen? Mail ons op info@spectux.com</p>
+            </div>`
+          );
+
+          return jsonResponse({ message: 'Plan geactiveerd voor bestaand account', user_id: existingUser.id }, 200, request);
+        } else {
+          // Nieuw account aanmaken
+          if (!password_hash || !name) {
+            return jsonResponse({ error: 'name en password_hash vereist voor nieuw account' }, 400, request);
+          }
+
+          const newId = crypto.randomUUID();
+
+          // Account aanmaken met plan_factuur=1 en direct geverifieerd (betaling is verificatie genoeg)
+          await env.DB.prepare(
+            `INSERT INTO users (id, name, email, password_hash, is_verified, plan_factuur, plan_planner)
+             VALUES (?, ?, ?, ?, 1, 1, 0)`
+          ).bind(newId, name.trim(), normalizedEmail, password_hash).run();
+
+          // Welkomstmail met inloglink
+          await sendEmail(
+            env.RESEND_API_KEY,
+            normalizedEmail,
+            'Welkom bij Spectux — jouw account is klaar!',
+            `<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#333">
+              <h2 style="color:#4f46e5">Welkom bij Spectux, ${name}! 🎉</h2>
+              <p>Je abonnement is actief en je Factuur Tool account staat klaar.</p>
+              <p>Log in met je e-mailadres en het wachtwoord dat je hebt gekozen:</p>
+              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">
+                Inloggen bij Spectux Portaal
+              </a>
+              <p><strong>E-mail:</strong> ${normalizedEmail}</p>
+              <p style="color:#888;font-size:13px">Vragen? Mail ons op info@spectux.com</p>
+            </div>`
+          );
+
+          return jsonResponse({ message: 'Nieuw account aangemaakt en plan geactiveerd', user_id: newId }, 200, request);
+        }
+      }
+
+      // ==========================================
       // 1. PUBLIC AUTH ROUTES
       // ==========================================
       if (path.startsWith('/api/auth/')) {
+
+        // ── NIEUW: e-mail check (voor de promobox te weten of account bestaat) ──
+        if (path === '/api/auth/check-email' && request.method === 'POST') {
+          const { email } = await request.json();
+          const normalizedEmail = email.toLowerCase().trim();
+          const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(normalizedEmail).first();
+          return jsonResponse({ exists: !!existing }, 200, request);
+        }
+
         if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405, request);
 
         if (path === '/api/auth/register') {
           const { name, email, password } = await request.json();
-          // FIX: E-mail altijd lowercase opslaan
           const normalizedEmail = email.toLowerCase().trim();
 
           const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(normalizedEmail).first();
@@ -176,7 +256,6 @@ export default {
 
         if (path === '/api/auth/verify') {
           const { email, code } = await request.json();
-          // FIX: E-mail normaliseren
           const normalizedEmail = email.toLowerCase().trim();
 
           const user = await env.DB.prepare('SELECT * FROM users WHERE email = ? AND verification_code = ?').bind(normalizedEmail, code).first();
@@ -188,7 +267,6 @@ export default {
 
         if (path === '/api/auth/login') {
           const { email, password } = await request.json();
-          // FIX: E-mail altijd lowercase voor vergelijking
           const normalizedEmail = email.toLowerCase().trim();
           const passwordHash = await hashPassword(password);
 
