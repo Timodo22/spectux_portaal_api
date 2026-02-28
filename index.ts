@@ -54,22 +54,13 @@ export default {
       // 0. PORTAL ADMIN ROUTES (eigen secret)
       // ==========================================
       if (path.startsWith('/api/portal-admin/')) {
-        const adminSecret = (request.headers.get('X-Admin-Secret') || '').trim();
+        // Authorization header gebruiken (geen custom header = geen CORS problemen)
+        const authHeader = request.headers.get('Authorization') || '';
+        const adminSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
         const expectedSecret = (env.ADMIN_SECRET || '').trim();
 
-        // Tijdelijke debug route — verwijder dit later!
-        if (path === '/api/portal-admin/debug') {
-          return jsonResponse({
-            received_length: adminSecret.length,
-            expected_length: expectedSecret.length,
-            match: adminSecret === expectedSecret,
-            received_first3: adminSecret.substring(0, 3),
-            expected_first3: expectedSecret.substring(0, 3),
-          }, 200, request);
-        }
-
         if (!adminSecret || adminSecret !== expectedSecret) {
-          return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
+          return jsonResponse({ error: 'Niet geautoriseerd', received_len: adminSecret.length, expected_len: expectedSecret.length }, 401, request);
         }
 
         // Alle gebruikers ophalen
@@ -221,12 +212,12 @@ export default {
       // ==========================================
       const authHeader = request.headers.get("Authorization");
       if (!authHeader?.startsWith("Bearer ")) {
-        return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
+        return jsonResponse({ error: 'Niet geautoriseerd', received_len: adminSecret.length, expected_len: expectedSecret.length }, 401, request);
       }
       const userId = authHeader.split(" ")[1];
 
       const userRecord = await env.DB.prepare('SELECT id, plan_factuur FROM users WHERE id = ?').bind(userId).first();
-      if (!userRecord) return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
+      if (!userRecord) return jsonResponse({ error: 'Niet geautoriseerd', received_len: adminSecret.length, expected_len: expectedSecret.length }, 401, request);
 
       // --- DASHBOARD ---
       if (request.method === "GET" && path === "/api/dashboard") {
