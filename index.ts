@@ -54,8 +54,21 @@ export default {
       // 0. PORTAL ADMIN ROUTES (eigen secret)
       // ==========================================
       if (path.startsWith('/api/portal-admin/')) {
-        const adminSecret = request.headers.get('X-Admin-Secret');
-        if (!adminSecret || adminSecret !== env.ADMIN_SECRET) {
+        const adminSecret = (request.headers.get('X-Admin-Secret') || '').trim();
+        const expectedSecret = (env.ADMIN_SECRET || '').trim();
+
+        // Tijdelijke debug route — verwijder dit later!
+        if (path === '/api/portal-admin/debug') {
+          return jsonResponse({
+            received_length: adminSecret.length,
+            expected_length: expectedSecret.length,
+            match: adminSecret === expectedSecret,
+            received_first3: adminSecret.substring(0, 3),
+            expected_first3: expectedSecret.substring(0, 3),
+          }, 200, request);
+        }
+
+        if (!adminSecret || adminSecret !== expectedSecret) {
           return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
         }
 
