@@ -1,5 +1,4 @@
 // --- HULPFUNCTIES ---
-
 const generateCode = () => Math.floor(100000 + Math.random() * 900000).toString();
 
 async function hashPassword(password) {
@@ -26,18 +25,16 @@ async function sendEmail(apiKey, to, subject, html) {
   return res.ok;
 }
 
-// --- CORS & RESPONSE HELPER ---
 function getCorsHeaders(request) {
   const allowedOrigins = ['http://localhost:8080', 'http://localhost:5173', 'http://localhost:3000', 'https://spectux.com', 'https://www.spectux.com'];
   const origin = request.headers.get('Origin');
   const isAllowed = allowedOrigins.includes(origin);
 
   return {
-    "Access-Control-Allow-Origin": isAllowed ? origin : allowedOrigins[0],
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Origin": isAllowed ? origin : allowedOrigins[0] || "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Max-Age": "600",
-    "Access-Control-Allow-Credentials": "true"
+    "Access-Control-Max-Age": "86400",
   };
 }
 
@@ -52,10 +49,8 @@ function jsonResponse(body, status, request) {
 }
 
 // --- MAIN WORKER ---
-
 export default {
   async fetch(request, env, ctx) {
-    // 1. Handel CORS Preflight (OPTIONS) af
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: getCorsHeaders(request) });
     }
@@ -63,153 +58,145 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Alleen POST requests toestaan voor onze auth routes
-    if (request.method !== "POST") {
-      return jsonResponse({ error: "Method not allowed" }, 405, request);
-    }
-
     try {
-      // --- ROUTE: INLOGGEN MET GOOGLE ---
-      if (path === '/api/auth/google') {
-        const { token } = await request.json();
+      // ==========================================
+      // 1. PUBLIC AUTH ROUTES
+      // ==========================================
+      if (path.startsWith('/api/auth/')) {
+        if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405, request);
 
-        // 1. Verifieer het token bij Google
-        const googleRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`);
-        if (!googleRes.ok) return jsonResponse({ error: 'Ongeldig Google token' }, 401, request);
-        
-        const googleUser = await googleRes.json();
-        const { sub: googleId, email, name, email_verified } = googleUser;
+        if (path === '/api/auth/register') {
+          const { name, email, password } = await request.json();
+          const existingUser = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+          if (existingUser) return jsonResponse({ error: 'E-mailadres is al in gebruik' }, 400, request);
 
-        if (email_verified !== "true") {
-          return jsonResponse({ error: 'Google e-mailadres is niet geverifieerd' }, 403, request);
-        }
-
-        // 2. Kijk of de gebruiker al bestaat in jouw database
-        let user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
-
-        if (user) {
-          // Gebruiker bestaat. Koppel Google ID als dit nog niet is gebeurd.
-          if (!user.google_id) {
-            await env.DB.prepare('UPDATE users SET google_id = ?, provider = ?, is_verified = 1 WHERE email = ?')
-              .bind(googleId, 'google', email).run();
-          }
-        } else {
-          // 3. Maak een nieuwe gebruiker aan als deze niet bestaat
           const id = crypto.randomUUID();
+          const passwordHash = await hashPassword(password);
+          const code = generateCode();
+          const expires = new Date(Date.now() + 15 * 60000).toISOString(); 
+
           await env.DB.prepare(
-            `INSERT INTO users (id, name, email, provider, google_id, is_verified) VALUES (?, ?, ?, ?, ?, ?)`
-          ).bind(id, name, email, 'google', googleId, 1).run(); // is_verified is direct 1
-          
-          user = await env.DB.prepare('SELECT id, name, plan_factuur, plan_planner FROM users WHERE email = ?').bind(email).first();
+            `INSERT INTO users (id, name, email, password_hash, verification_code, verification_expires, plan_factuur, plan_planner) VALUES (?, ?, ?, ?, ?, ?, 0, 0)`
+          ).bind(id, name, email, passwordHash, code, expires).run();
+
+          await sendEmail(env.RESEND_API_KEY, email, 'Verifieer je account', `<p>Welkom bij Spectux! Je code is: <strong>${code}</strong></p>`);
+          return jsonResponse({ message: 'Code verstuurd' }, 200, request);
         }
 
-        // 4. Stuur succes response terug
-        return jsonResponse({ 
-          message: 'Succesvol ingelogd met Google',
-          user: {
-            id: user.id,
-            name: user.name,
-            plans: { factuur: Boolean(user.plan_factuur), planner: Boolean(user.plan_planner) }
+        if (path === '/api/auth/verify') {
+          const { email, code } = await request.json();
+          const user = await env.DB.prepare('SELECT * FROM users WHERE email = ? AND verification_code = ?').bind(email, code).first();
+          if (!user) return jsonResponse({ error: 'Ongeldige code' }, 400, request);
+          if (new Date(user.verification_expires) < new Date()) return jsonResponse({ error: 'Code is verlopen.' }, 400, request);
+
+          await env.DB.prepare('UPDATE users SET is_verified = 1, verification_code = NULL, verification_expires = NULL WHERE email = ?').bind(email).run();
+          return jsonResponse({ message: 'Account geverifieerd' }, 200, request);
+        }
+
+        if (path === '/api/auth/login') {
+          const { email, password } = await request.json();
+          const passwordHash = await hashPassword(password);
+          const user = await env.DB.prepare('SELECT id, name, is_verified, plan_factuur, plan_planner FROM users WHERE email = ? AND password_hash = ?').bind(email, passwordHash).first();
+
+          if (!user) return jsonResponse({ error: 'Ongeldige inloggegevens.' }, 401, request);
+          if (user.is_verified === 0) return jsonResponse({ error: 'Account is niet geverifieerd' }, 403, request);
+
+          return jsonResponse({ 
+            message: 'Succesvol ingelogd',
+            token: user.id, // Simpele token setup voor nu
+            user: { id: user.id, name: user.name, plans: { factuur: Boolean(user.plan_factuur), planner: Boolean(user.plan_planner) } }
+          }, 200, request);
+        }
+      }
+
+      // ==========================================
+      // 2. PROTECTED ROUTES (Requires Authorization Header)
+      // ==========================================
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
+      }
+      const userId = authHeader.split(" ")[1];
+
+      // --- DASHBOARD & FACTUREN LIJST ---
+      if (request.method === "GET" && path === "/api/dashboard") {
+        const { results: invoices } = await env.DB.prepare('SELECT * FROM invoices WHERE user_id = ? ORDER BY created_at DESC').bind(userId).all();
+        
+        let stats = { openstaand: 0, betaaldDitJaar: 0, verlopen: 0, omzetExclBtw: 0, btwTeBetalen: 0 };
+        const currentYear = new Date().getFullYear();
+
+        invoices.forEach(inv => {
+          if (inv.status === 'Openstaand' || inv.status === 'Concept') stats.openstaand += inv.total;
+          if (inv.status === 'Vervallen') stats.verlopen += inv.total;
+          if (inv.status === 'Betaald') {
+            stats.betaaldDitJaar += inv.total;
+            stats.omzetExclBtw += inv.subtotal;
+            stats.btwTeBetalen += inv.vat_total;
           }
-        }, 200, request);
+        });
+
+        return jsonResponse({ invoices, stats }, 200, request);
       }
 
-      // --- ROUTE: REGISTREREN ---
-      if (path === '/api/auth/register') {
-        const { name, email, password } = await request.json();
-        
-        const existingUser = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
-        if (existingUser) return jsonResponse({ error: 'E-mailadres is al in gebruik' }, 400, request);
-
-        const id = crypto.randomUUID();
-        const passwordHash = await hashPassword(password);
-        const code = generateCode();
-        const expires = new Date(Date.now() + 15 * 60000).toISOString(); 
-
-        await env.DB.prepare(
-          `INSERT INTO users (id, name, email, password_hash, verification_code, verification_expires, provider) VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).bind(id, name, email, passwordHash, code, expires, 'local').run();
-
-        const emailSent = await sendEmail(env.RESEND_API_KEY, email, 'Verifieer je account', `<p>Welkom bij Spectux! Je verificatiecode is: <strong>${code}</strong></p>`);
-        
-        if (!emailSent) return jsonResponse({ error: 'Kon e-mail niet versturen' }, 500, request);
-        return jsonResponse({ message: 'Code verstuurd' }, 200, request);
-      }
-
-      // --- ROUTE: VERIFIEER EMAIL ---
-      if (path === '/api/auth/verify') {
-        const { email, code } = await request.json();
-        const user = await env.DB.prepare('SELECT * FROM users WHERE email = ? AND verification_code = ?').bind(email, code).first();
-
-        if (!user) return jsonResponse({ error: 'Ongeldige code' }, 400, request);
-        if (new Date(user.verification_expires) < new Date()) {
-          return jsonResponse({ error: 'Code is verlopen. Vraag een nieuwe aan.' }, 400, request);
+      // --- BEDRIJFSINSTELLINGEN (Ophalen & Opslaan) ---
+      if (path === "/api/settings") {
+        if (request.method === "GET") {
+          const settings = await env.DB.prepare('SELECT * FROM user_settings WHERE user_id = ?').bind(userId).first() || {};
+          return jsonResponse({ settings }, 200, request);
         }
-
-        await env.DB.prepare('UPDATE users SET is_verified = 1, verification_code = NULL, verification_expires = NULL WHERE email = ?').bind(email).run();
-        return jsonResponse({ message: 'Account succesvol geverifieerd' }, 200, request);
+        
+        if (request.method === "POST") {
+          const data = await request.json();
+          await env.DB.prepare(`
+            INSERT INTO user_settings (user_id, company_name, address, zipcode_city, kvk_number, btw_number, iban)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET 
+            company_name=excluded.company_name, address=excluded.address, zipcode_city=excluded.zipcode_city,
+            kvk_number=excluded.kvk_number, btw_number=excluded.btw_number, iban=excluded.iban
+          `).bind(userId, data.company_name, data.address, data.zipcode_city, data.kvk_number, data.btw_number, data.iban).run();
+          return jsonResponse({ message: "Instellingen opgeslagen" }, 200, request);
+        }
       }
 
-      // --- ROUTE: INLOGGEN ---
-      if (path === '/api/auth/login') {
-        const { email, password } = await request.json();
-        const passwordHash = await hashPassword(password);
-
-        const user = await env.DB.prepare(
-          'SELECT id, name, is_verified, plan_factuur, plan_planner FROM users WHERE email = ? AND password_hash = ?'
-        ).bind(email, passwordHash).first();
-
-        if (!user) return jsonResponse({ error: 'Ongeldige inloggegevens. Log je misschien in via Google?' }, 401, request);
-        if (user.is_verified === 0) return jsonResponse({ error: 'Account is nog niet geverifieerd' }, 403, request);
-
-        return jsonResponse({ 
-          message: 'Succesvol ingelogd',
-          user: {
-            id: user.id,
-            name: user.name,
-            plans: { factuur: Boolean(user.plan_factuur), planner: Boolean(user.plan_planner) }
+      // --- FACTUUR AANMAKEN ---
+      if (request.method === "POST" && path === "/api/invoices") {
+        const user = await env.DB.prepare('SELECT plan_factuur FROM users WHERE id = ?').bind(userId).first();
+        
+        // DEMO CHECK
+        if (!user.plan_factuur) {
+          const { results } = await env.DB.prepare('SELECT count(*) as count FROM invoices WHERE user_id = ?').bind(userId).all();
+          if (results[0].count >= 3) {
+            return jsonResponse({ error: "Demo limiet bereikt (max 3 facturen). Upgrade je account." }, 403, request);
           }
-        }, 200, request);
-      }
-
-      // --- ROUTE: WACHTWOORD RESET CODE AANVRAGEN ---
-      if (path === '/api/auth/forgot-password') {
-        const { email } = await request.json();
-        
-        const user = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
-        if (!user) return jsonResponse({ message: 'Als dit e-mailadres bestaat, is er een code gestuurd.' }, 200, request);
-
-        const code = generateCode();
-        const expires = new Date(Date.now() + 15 * 60000).toISOString();
-
-        await env.DB.prepare('UPDATE users SET verification_code = ?, verification_expires = ? WHERE email = ?').bind(code, expires, email).run();
-        await sendEmail(env.RESEND_API_KEY, email, 'Wachtwoord herstellen', `<p>Je code om je wachtwoord te herstellen is: <strong>${code}</strong></p>`);
-
-        return jsonResponse({ message: 'Code verstuurd' }, 200, request);
-      }
-
-      // --- ROUTE: NIEUW WACHTWOORD INSTELLEN ---
-      if (path === '/api/auth/reset-password') {
-        const { email, code, newPassword } = await request.json();
-
-        const user = await env.DB.prepare('SELECT * FROM users WHERE email = ? AND verification_code = ?').bind(email, code).first();
-
-        if (!user) return jsonResponse({ error: 'Ongeldige code' }, 400, request);
-        if (new Date(user.verification_expires) < new Date()) {
-          return jsonResponse({ error: 'Code is verlopen' }, 400, request);
         }
 
-        const passwordHash = await hashPassword(newPassword);
-        await env.DB.prepare('UPDATE users SET password_hash = ?, verification_code = NULL, verification_expires = NULL WHERE email = ?').bind(passwordHash, email).run();
+        const inv = await request.json();
+        const invId = crypto.randomUUID();
 
-        return jsonResponse({ message: 'Wachtwoord succesvol gewijzigd' }, 200, request);
+        await env.DB.prepare(`
+          INSERT INTO invoices (id, user_id, invoice_number, issue_date, due_date, status, customer_name, subtotal, vat_total, total, template_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(invId, userId, inv.invoice_number, inv.issue_date, inv.due_date, inv.status, inv.customer_name, inv.subtotal, inv.vat_total, inv.total, inv.template_id).run();
+
+        // Voor het gemak slaan we de factuurregels hier even over in de db opslag voor deze simpele flow, 
+        // maar in een echt systeem loop je hier over inv.lines heen en doe je INSERT INTO invoice_lines.
+
+        return jsonResponse({ message: "Factuur succesvol opgeslagen", id: invId }, 200, request);
       }
 
-      // Als de route niet wordt herkend:
+      // --- FACTUUR STATUS UPDATEN ---
+      if (request.method === "PUT" && path.startsWith("/api/invoices/")) {
+        const invoiceId = path.split("/").pop(); // Haal ID uit URL
+        const { status } = await request.json();
+        
+        await env.DB.prepare('UPDATE invoices SET status = ? WHERE id = ? AND user_id = ?').bind(status, invoiceId, userId).run();
+        return jsonResponse({ message: "Status aangepast" }, 200, request);
+      }
+
       return jsonResponse({ error: 'Route niet gevonden' }, 404, request);
 
     } catch (error) {
-      return jsonResponse({ error: 'Interne serverfout: ' + error.message }, 500, request);
+      return jsonResponse({ error: 'Serverfout: ' + error.message }, 500, request);
     }
   }
 };
