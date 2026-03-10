@@ -715,6 +715,218 @@ export default {
         return jsonResponse({ error: 'Planner route niet gevonden' }, 404, request);
       }
 
+      // ==========================================
+      // PUBLIC BOOKING ROUTES (geen auth vereist)
+      // Gebruikt door spectux.com/booking/[slug]
+      // ==========================================
+      if (path.startsWith('/api/public/booking/')) {
+        const parts = path.split('/'); // ['','api','public','booking',slug,...rest]
+        const slug  = parts[4];
+        const sub   = parts[5]; // 'availability' | undefined
+
+        if (!slug) return jsonResponse({ error: 'Geen slug opgegeven' }, 400, request);
+
+        // Zoek user op basis van slug
+        const settings = await env.DB.prepare(
+          'SELECT * FROM planner_settings WHERE publieke_url_slug = ?'
+        ).bind(slug).first();
+
+        if (!settings) return jsonResponse({ error: 'Boekingspagina niet gevonden' }, 404, request);
+
+        const userId = settings.user_id;
+
+        // Check of user premium planner heeft
+        const user = await env.DB.prepare('SELECT plan_planner FROM users WHERE id = ?').bind(userId).first();
+        if (!user?.plan_planner) {
+          return jsonResponse({ error: 'Deze boekingspagina is niet actief.' }, 403, request);
+        }
+
+        // ── GET /api/public/booking/:slug — info + diensten + medewerkers ──
+        if (!sub && request.method === 'GET') {
+          const { results: services } = await env.DB.prepare(
+            'SELECT id, naam, duur_in_minuten, prijs, kleur, beschrijving FROM planner_services WHERE user_id = ? ORDER BY naam ASC'
+          ).bind(userId).all();
+
+          const { results: staff } = await env.DB.prepare(
+            'SELECT id, naam, functie, kleur FROM planner_staff WHERE user_id = ? ORDER BY naam ASC'
+          ).bind(userId).all();
+
+          const { results: availabilities } = await env.DB.prepare(
+            'SELECT dag_van_de_week, start_tijd, eind_tijd, is_beschikbaar FROM planner_availabilities WHERE user_id = ? ORDER BY dag_van_de_week ASC'
+          ).bind(userId).all();
+
+          return jsonResponse({
+            bedrijfs_naam:         settings.bedrijfs_naam || '',
+            bedrijfs_beschrijving: settings.bedrijfs_beschrijving || '',
+            slug:                  settings.publieke_url_slug,
+            slot_interval:         settings.slot_interval || 15,
+            max_days_vooruit:      settings.max_days_vooruit || 30,
+            availability_mode:     settings.availability_mode || 'recurring',
+            services,
+            staff,
+            availabilities,
+          }, 200, request);
+        }
+
+        // ── GET /api/public/booking/:slug/availability?datum=YYYY-MM-DD ──
+        // Geeft beschikbare tijdsloten terug op een specifieke datum
+        if (sub === 'availability' && request.method === 'GET') {
+          const datum = url.searchParams.get('datum');
+          const serviceId = url.searchParams.get('service_id');
+          if (!datum) return jsonResponse({ error: 'datum parameter vereist' }, 400, request);
+
+          // Duur van de dienst ophalen
+          let duur = settings.slot_interval || 15;
+          if (serviceId) {
+            const svc = await env.DB.prepare('SELECT duur_in_minuten FROM planner_services WHERE id = ? AND user_id = ?').bind(serviceId, userId).first();
+            if (svc) duur = svc.duur_in_minuten;
+          }
+
+          // Bestaande afspraken op die datum
+          const { results: bestaandeAfspraken } = await env.DB.prepare(
+            "SELECT start_tijd, eind_tijd FROM planner_appointments WHERE user_id = ? AND datum = ? AND status != 'geannuleerd'"
+          ).bind(userId, datum).all();
+
+          const bezet = bestaandeAfspraken.map(a => ({ start: a.start_tijd, eind: a.eind_tijd }));
+
+          // Helper: minuten naar "HH:MM"
+          const minToTime = (m) => `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+          const timeToMin = (t) => { const [h,m] = t.split(':').map(Number); return h*60+m; };
+          const overlaps = (startA, eindA, startB, eindB) => startA < eindB && eindA > startB;
+
+          let windows = []; // [{van: minutes, tot: minutes}]
+
+          if (settings.availability_mode === 'custom_slots') {
+            // Gebruik tijdsloten uit DB voor deze datum
+            const { results: slots } = await env.DB.prepare(
+              'SELECT start_tijd, eind_tijd FROM planner_timeslots WHERE user_id = ? AND datum = ? ORDER BY start_tijd ASC'
+            ).bind(userId, datum).all();
+            windows = slots.map(s => ({ van: timeToMin(s.start_tijd), tot: timeToMin(s.eind_tijd) }));
+          } else {
+            // Terugkerend patroon: kijk welke dag van de week
+            const dayOfWeek = (new Date(datum).getDay() + 6) % 7; // 0=ma, 6=zo
+            const { results: avails } = await env.DB.prepare(
+              'SELECT start_tijd, eind_tijd, is_beschikbaar FROM planner_availabilities WHERE user_id = ? AND dag_van_de_week = ?'
+            ).bind(userId, dayOfWeek).all();
+            for (const a of avails) {
+              if (a.is_beschikbaar) windows.push({ van: timeToMin(a.start_tijd), tot: timeToMin(a.eind_tijd) });
+            }
+          }
+
+          // Genereer slots per slot_interval, filter bezette
+          const interval = settings.slot_interval || 15;
+          const beschikbaar = [];
+
+          for (const w of windows) {
+            let cur = w.van;
+            while (cur + duur <= w.tot) {
+              const slotEnd = cur + duur;
+              const slotStart_str = minToTime(cur);
+              const slotEnd_str   = minToTime(slotEnd);
+              const isBezet = bezet.some(b => overlaps(cur, slotEnd, timeToMin(b.start), timeToMin(b.eind)));
+              if (!isBezet) beschikbaar.push({ start_tijd: slotStart_str, eind_tijd: slotEnd_str });
+              cur += interval;
+            }
+          }
+
+          return jsonResponse({ datum, slots: beschikbaar }, 200, request);
+        }
+
+        // ── POST /api/public/booking/:slug — nieuwe afspraak aanmaken ──
+        if (!sub && request.method === 'POST') {
+          const body = await request.json();
+          const { service_id, staff_id, klant_naam, klant_email, klant_telefoon, datum, start_tijd, notitie } = body;
+
+          if (!service_id || !klant_naam || !klant_email || !datum || !start_tijd) {
+            return jsonResponse({ error: 'Vul alle verplichte velden in (dienst, naam, email, datum, tijd)' }, 400, request);
+          }
+
+          // Dienst ophalen
+          const svc = await env.DB.prepare('SELECT * FROM planner_services WHERE id = ? AND user_id = ?').bind(service_id, userId).first();
+          if (!svc) return jsonResponse({ error: 'Dienst niet gevonden' }, 404, request);
+
+          // Eindtijd berekenen
+          const [h, m] = start_tijd.split(':').map(Number);
+          const endMin  = h * 60 + m + svc.duur_in_minuten;
+          const eind_tijd = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
+
+          // Check of slot al bezet is
+          const conflict = await env.DB.prepare(
+            "SELECT id FROM planner_appointments WHERE user_id=? AND datum=? AND status!='geannuleerd' AND start_tijd < ? AND eind_tijd > ?"
+          ).bind(userId, datum, eind_tijd, start_tijd).first();
+          if (conflict) return jsonResponse({ error: 'Dit tijdstip is helaas al bezet. Kies een ander tijdslot.' }, 409, request);
+
+          // Medewerker info
+          let staff_naam = '';
+          if (staff_id) {
+            const stf = await env.DB.prepare('SELECT naam FROM planner_staff WHERE id = ? AND user_id = ?').bind(staff_id, userId).first();
+            if (stf) staff_naam = stf.naam;
+          }
+
+          const id = crypto.randomUUID();
+          const cancellation_token = crypto.randomUUID();
+
+          await env.DB.prepare(`
+            INSERT INTO planner_appointments
+              (id, user_id, service_id, staff_id, klant_naam, klant_email, klant_telefoon,
+               datum, start_tijd, eind_tijd, service_naam, service_kleur, staff_naam,
+               status, notitie, cancellation_token, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'bevestigd',?,?,datetime('now'))
+          `).bind(
+            id, userId, service_id, staff_id || null,
+            klant_naam, klant_email, klant_telefoon || null,
+            datum, start_tijd, eind_tijd,
+            svc.naam, svc.kleur, staff_naam,
+            notitie || null, cancellation_token
+          ).run();
+
+          // Bevestigingsmail naar klant
+          if (env.RESEND_API_KEY) {
+            const datumNL = new Date(datum).toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+            await sendEmail(
+              env.RESEND_API_KEY,
+              klant_email,
+              `Afspraakbevestiging — ${svc.naam} bij ${settings.bedrijfs_naam || 'Spectux'}`,
+              `<h2>Je afspraak is bevestigd! ✅</h2>
+              <p>Hoi ${klant_naam},</p>
+              <p>Je afspraak staat gepland:</p>
+              <ul>
+                <li><strong>Dienst:</strong> ${svc.naam}</li>
+                ${staff_naam ? `<li><strong>Medewerker:</strong> ${staff_naam}</li>` : ''}
+                <li><strong>Datum:</strong> ${datumNL}</li>
+                <li><strong>Tijd:</strong> ${start_tijd} – ${eind_tijd}</li>
+                <li><strong>Locatie:</strong> ${settings.bedrijfs_naam || ''}</li>
+              </ul>
+              <p>Wil je annuleren? <a href="https://spectux.com/booking/${slug}/cancel/${cancellation_token}">Klik hier om te annuleren</a>.</p>
+              <p>Tot dan!<br/>${settings.bedrijfs_naam || 'Spectux'}</p>`
+            );
+          }
+
+          return jsonResponse({
+            success: true,
+            id,
+            cancellation_token,
+            afspraak: { datum, start_tijd, eind_tijd, service_naam: svc.naam, staff_naam },
+          }, 201, request);
+        }
+
+        // ── GET /api/public/booking/:slug/cancel/:token — afspraak annuleren ──
+        if (sub === 'cancel' && request.method === 'POST') {
+          const token = parts[6];
+          if (!token) return jsonResponse({ error: 'Geen token' }, 400, request);
+          const appt = await env.DB.prepare(
+            "SELECT id, klant_naam, datum, start_tijd, service_naam FROM planner_appointments WHERE cancellation_token = ? AND user_id = ?"
+          ).bind(token, userId).first();
+          if (!appt) return jsonResponse({ error: 'Afspraak niet gevonden of al geannuleerd' }, 404, request);
+          await env.DB.prepare(
+            "UPDATE planner_appointments SET status = 'geannuleerd' WHERE cancellation_token = ?"
+          ).bind(token).run();
+          return jsonResponse({ success: true, message: `Afspraak van ${appt.klant_naam} op ${appt.datum} om ${appt.start_tijd} is geannuleerd.` }, 200, request);
+        }
+
+        return jsonResponse({ error: 'Route niet gevonden' }, 404, request);
+      }
+
       return jsonResponse({ error: 'Route niet gevonden' }, 404, request);
 
     } catch (error) {
