@@ -158,6 +158,47 @@ export default {
           return jsonResponse({ message: 'Plan bijgewerkt' }, 200, request);
         }
 
+        if (path.match(/^\/api\/portal-admin\/users\/[^/]+\/toggle-planner$/) && request.method === 'POST') {
+          const userId = path.split('/')[4];
+          const { plan_planner } = await request.json();
+          await env.DB.prepare('UPDATE users SET plan_planner = ? WHERE id = ?').bind(plan_planner ? 1 : 0, userId).run();
+          return jsonResponse({ message: 'Planner plan bijgewerkt' }, 200, request);
+        }
+
+        if (path === '/api/portal-admin/planner-stats' && request.method === 'GET') {
+          const totalServices     = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_services').first();
+          const totalStaff        = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_staff').first();
+          const totalAppointments = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_appointments').first();
+          const totalTimeslots    = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_timeslots').first();
+          const plannerPremium    = await env.DB.prepare('SELECT COUNT(*) as c FROM users WHERE plan_planner = 1').first();
+          const activeToday       = await env.DB.prepare("SELECT COUNT(*) as c FROM planner_appointments WHERE datum = date('now') AND status = 'bevestigd'").first();
+          const thisWeek          = await env.DB.prepare("SELECT COUNT(*) as c FROM planner_appointments WHERE datum >= date('now') AND datum <= date('now','+7 days')").first();
+          const byStatus          = await env.DB.prepare("SELECT status, COUNT(*) as count FROM planner_appointments GROUP BY status").all();
+          const topUsers          = await env.DB.prepare(`
+            SELECT u.id, u.name, u.email, u.plan_planner,
+              (SELECT COUNT(*) FROM planner_appointments a WHERE a.user_id = u.id) as appt_count,
+              (SELECT COUNT(*) FROM planner_services s WHERE s.user_id = u.id) as service_count,
+              (SELECT COUNT(*) FROM planner_staff st WHERE st.user_id = u.id) as staff_count,
+              (SELECT publieke_url_slug FROM planner_settings ps WHERE ps.user_id = u.id) as slug
+            FROM users u
+            WHERE u.plan_planner = 1 OR (SELECT COUNT(*) FROM planner_services WHERE user_id = u.id) > 0
+            ORDER BY appt_count DESC
+            LIMIT 20
+          `).all();
+
+          return jsonResponse({
+            total_services:      totalServices?.c || 0,
+            total_staff:         totalStaff?.c || 0,
+            total_appointments:  totalAppointments?.c || 0,
+            total_timeslots:     totalTimeslots?.c || 0,
+            planner_premium:     plannerPremium?.c || 0,
+            active_today:        activeToday?.c || 0,
+            this_week:           thisWeek?.c || 0,
+            by_status:           byStatus?.results || [],
+            top_users:           topUsers?.results || [],
+          }, 200, request);
+        }
+
         if (path.match(/^\/api\/portal-admin\/users\/[^/]+$/) && request.method === 'DELETE') {
           const userId = path.split('/')[4];
           await env.DB.prepare('DELETE FROM invoices WHERE user_id = ?').bind(userId).run();
