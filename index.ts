@@ -1,10 +1,19 @@
 // ==========================================
-// SPECTUX PORTAAL WORKER
+// SPECTUX PORTAAL WORKER — v3
 // ==========================================
-// Nieuw in deze versie:
-//   POST /api/auth/check-email          → checkt of een email al bestaat
-//   POST /api/internal/activate-plan    → intern endpoint (INTERNAL_SECRET)
-//                                          maakt account aan of activeert plan_factuur
+// Nieuw in v3:
+//   POST/GET/DELETE /api/planner/services
+//   POST/GET/DELETE /api/planner/staff
+//   POST/GET/DELETE /api/planner/appointments
+//   PUT             /api/planner/appointments/:id/status
+//   POST/GET/DELETE /api/planner/timeslots
+//   GET/PUT         /api/planner/settings
+//   GET             /api/planner/google/auth-url  (stub)
+//   POST            /api/planner/google/disconnect
+//   DELETE          /api/invoices/:id
+//   GET             /api/invoices/:id
+//   PUT             /api/invoices/:id   (bewerken)
+//   scheduled       → verwijdert planner data ouder dan 10 dagen
 // ==========================================
 
 const generateCode = () => Math.floor(100000 + Math.random() * 900000).toString();
@@ -47,6 +56,26 @@ function jsonResponse(body, status, request) {
 }
 
 export default {
+  // ──────────────────────────────────────────────
+  // SCHEDULED: elke dag om 03:00 UTC
+  // Verwijdert planner data ouder dan 10 dagen
+  // Voeg in wrangler.toml toe:
+  //   [triggers]
+  //   crons = ["0 3 * * *"]
+  // ──────────────────────────────────────────────
+  async scheduled(event, env, ctx) {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 10);
+    const cutoffStr = cutoff.toISOString().split('T')[0];
+    try {
+      await env.DB.prepare('DELETE FROM planner_appointments WHERE datum < ?').bind(cutoffStr).run();
+      await env.DB.prepare('DELETE FROM planner_timeslots WHERE datum < ?').bind(cutoffStr).run();
+      console.log(`[cleanup] Verwijderd planner data vóór ${cutoffStr}`);
+    } catch (e) {
+      console.error('[cleanup] Fout:', e.message);
+    }
+  },
+
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: getCorsHeaders(request) });
@@ -134,6 +163,12 @@ export default {
           await env.DB.prepare('DELETE FROM invoices WHERE user_id = ?').bind(userId).run();
           await env.DB.prepare('DELETE FROM customers WHERE user_id = ?').bind(userId).run();
           await env.DB.prepare('DELETE FROM user_settings WHERE user_id = ?').bind(userId).run();
+          await env.DB.prepare('DELETE FROM planner_appointments WHERE user_id = ?').bind(userId).run();
+          await env.DB.prepare('DELETE FROM planner_timeslots WHERE user_id = ?').bind(userId).run();
+          await env.DB.prepare('DELETE FROM planner_services WHERE user_id = ?').bind(userId).run();
+          await env.DB.prepare('DELETE FROM planner_staff WHERE user_id = ?').bind(userId).run();
+          await env.DB.prepare('DELETE FROM planner_availabilities WHERE user_id = ?').bind(userId).run();
+          await env.DB.prepare('DELETE FROM planner_settings WHERE user_id = ?').bind(userId).run();
           await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
           return jsonResponse({ message: 'Gebruiker en alle data verwijderd' }, 200, request);
         }
@@ -142,8 +177,7 @@ export default {
       }
 
       // ==========================================
-      // INTERN ENDPOINT — Aangeroepen door pricing worker na betaling
-      // Beveiligd met INTERNAL_SECRET (aparte env variabele, NIET de admin secret)
+      // INTERN ENDPOINT
       // ==========================================
       if (path === '/api/internal/activate-plan' && request.method === 'POST') {
         const internalSecret = request.headers.get('X-Internal-Secret') || '';
@@ -157,57 +191,35 @@ export default {
         const existingUser = await env.DB.prepare('SELECT id, plan_factuur FROM users WHERE email = ?').bind(normalizedEmail).first();
 
         if (existingUser) {
-          // Bestaande gebruiker: zet plan_factuur op 1
           await env.DB.prepare('UPDATE users SET plan_factuur = 1 WHERE id = ?').bind(existingUser.id).run();
-
-          // Stuur bevestigingsmail
           await sendEmail(
-            env.RESEND_API_KEY,
-            normalizedEmail,
-            'Spectux Factuur Tool geactiveerd!',
+            env.RESEND_API_KEY, normalizedEmail, 'Spectux Factuur Tool geactiveerd!',
             `<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#333">
               <h2 style="color:#4f46e5">Factuur Tool geactiveerd 🎉</h2>
-              <p>Geweldig, je Spectux Factuur Tool is geactiveerd!</p>
-              <p>Log in op je bestaande account om direct te beginnen:</p>
-              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">
-                Open Portaal
-              </a>
+              <p>Je Spectux Factuur Tool is geactiveerd!</p>
+              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">Open Portaal</a>
               <p style="color:#888;font-size:13px">Vragen? Mail ons op info@spectux.com</p>
             </div>`
           );
-
           return jsonResponse({ message: 'Plan geactiveerd voor bestaand account', user_id: existingUser.id }, 200, request);
         } else {
-          // Nieuw account aanmaken
           if (!password_hash || !name) {
             return jsonResponse({ error: 'name en password_hash vereist voor nieuw account' }, 400, request);
           }
-
           const newId = crypto.randomUUID();
-
-          // Account aanmaken met plan_factuur=1 en direct geverifieerd (betaling is verificatie genoeg)
           await env.DB.prepare(
-            `INSERT INTO users (id, name, email, password_hash, is_verified, plan_factuur, plan_planner)
-             VALUES (?, ?, ?, ?, 1, 1, 0)`
+            `INSERT INTO users (id, name, email, password_hash, is_verified, plan_factuur, plan_planner) VALUES (?, ?, ?, ?, 1, 1, 0)`
           ).bind(newId, name.trim(), normalizedEmail, password_hash).run();
-
-          // Welkomstmail met inloglink
           await sendEmail(
-            env.RESEND_API_KEY,
-            normalizedEmail,
-            'Welkom bij Spectux — jouw account is klaar!',
+            env.RESEND_API_KEY, normalizedEmail, 'Welkom bij Spectux — jouw account is klaar!',
             `<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#333">
               <h2 style="color:#4f46e5">Welkom bij Spectux, ${name}! 🎉</h2>
               <p>Je abonnement is actief en je Factuur Tool account staat klaar.</p>
-              <p>Log in met je e-mailadres en het wachtwoord dat je hebt gekozen:</p>
-              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">
-                Inloggen bij Spectux Portaal
-              </a>
+              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">Inloggen bij Spectux Portaal</a>
               <p><strong>E-mail:</strong> ${normalizedEmail}</p>
               <p style="color:#888;font-size:13px">Vragen? Mail ons op info@spectux.com</p>
             </div>`
           );
-
           return jsonResponse({ message: 'Nieuw account aangemaakt en plan geactiveerd', user_id: newId }, 200, request);
         }
       }
@@ -217,7 +229,6 @@ export default {
       // ==========================================
       if (path.startsWith('/api/auth/')) {
 
-        // ── NIEUW: e-mail check (voor de promobox te weten of account bestaat) ──
         if (path === '/api/auth/check-email' && request.method === 'POST') {
           const { email } = await request.json();
           const normalizedEmail = email.toLowerCase().trim();
@@ -230,19 +241,15 @@ export default {
         if (path === '/api/auth/register') {
           const { name, email, password } = await request.json();
           const normalizedEmail = email.toLowerCase().trim();
-
           const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(normalizedEmail).first();
           if (existing) return jsonResponse({ error: 'E-mailadres is al in gebruik' }, 400, request);
-
           const id = crypto.randomUUID();
           const passwordHash = await hashPassword(password);
           const code = generateCode();
           const expires = new Date(Date.now() + 15 * 60000).toISOString();
-
           await env.DB.prepare(
             'INSERT INTO users (id, name, email, password_hash, verification_code, verification_expires, plan_factuur, plan_planner) VALUES (?, ?, ?, ?, ?, ?, 0, 0)'
           ).bind(id, name, normalizedEmail, passwordHash, code, expires).run();
-
           await sendEmail(env.RESEND_API_KEY, normalizedEmail, 'Verifieer je Spectux account',
             `<div style="font-family:sans-serif;max-width:480px;margin:auto">
               <h2>Welkom bij Spectux, ${name}!</h2>
@@ -257,7 +264,6 @@ export default {
         if (path === '/api/auth/verify') {
           const { email, code } = await request.json();
           const normalizedEmail = email.toLowerCase().trim();
-
           const user = await env.DB.prepare('SELECT * FROM users WHERE email = ? AND verification_code = ?').bind(normalizedEmail, code).first();
           if (!user) return jsonResponse({ error: 'Ongeldige code' }, 400, request);
           if (new Date(user.verification_expires) < new Date()) return jsonResponse({ error: 'Code is verlopen' }, 400, request);
@@ -269,14 +275,11 @@ export default {
           const { email, password } = await request.json();
           const normalizedEmail = email.toLowerCase().trim();
           const passwordHash = await hashPassword(password);
-
           const user = await env.DB.prepare(
             'SELECT id, name, is_verified, plan_factuur, plan_planner FROM users WHERE email = ? AND password_hash = ?'
           ).bind(normalizedEmail, passwordHash).first();
-
           if (!user) return jsonResponse({ error: 'Ongeldige inloggegevens' }, 401, request);
           if (user.is_verified === 0) return jsonResponse({ error: 'Account is niet geverifieerd' }, 403, request);
-
           return jsonResponse({
             message: 'Succesvol ingelogd',
             token: user.id,
@@ -294,7 +297,7 @@ export default {
       }
       const userId = authHeader.split(" ")[1];
 
-      const userRecord = await env.DB.prepare('SELECT id, plan_factuur FROM users WHERE id = ?').bind(userId).first();
+      const userRecord = await env.DB.prepare('SELECT id, plan_factuur, plan_planner FROM users WHERE id = ?').bind(userId).first();
       if (!userRecord) return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
 
       // --- DASHBOARD ---
@@ -302,9 +305,7 @@ export default {
         const { results: invoices } = await env.DB.prepare(
           'SELECT * FROM invoices WHERE user_id = ? ORDER BY created_at DESC'
         ).bind(userId).all();
-
         let stats = { openstaand: 0, betaaldDitJaar: 0, verlopen: 0, omzetExclBtw: 0, btwTeBetalen: 0 };
-
         invoices.forEach(inv => {
           if (inv.status === 'Openstaand' || inv.status === 'Offerte') stats.openstaand += inv.total || 0;
           if (inv.status === 'Verlopen') stats.verlopen += inv.total || 0;
@@ -314,7 +315,6 @@ export default {
             stats.btwTeBetalen += inv.vat_total || 0;
           }
         });
-
         return jsonResponse({ invoices, stats }, 200, request);
       }
 
@@ -324,7 +324,6 @@ export default {
           const settings = await env.DB.prepare('SELECT * FROM user_settings WHERE user_id = ?').bind(userId).first() || {};
           return jsonResponse({ settings }, 200, request);
         }
-
         if (request.method === "POST") {
           const data = await request.json();
           await env.DB.prepare(`
@@ -347,25 +346,17 @@ export default {
       // --- KLANTEN ---
       if (path === "/api/customers") {
         if (request.method === "GET") {
-          const { results } = await env.DB.prepare(
-            'SELECT * FROM customers WHERE user_id = ? ORDER BY name ASC'
-          ).bind(userId).all();
+          const { results } = await env.DB.prepare('SELECT * FROM customers WHERE user_id = ? ORDER BY name ASC').bind(userId).all();
           return jsonResponse({ customers: results }, 200, request);
         }
-
         if (request.method === "POST") {
           const data = await request.json();
           if (!data.name?.trim()) return jsonResponse({ error: 'Naam is verplicht' }, 400, request);
           if (!data.address?.trim()) return jsonResponse({ error: 'Adres is verplicht' }, 400, request);
-
           const id = crypto.randomUUID();
           await env.DB.prepare(
             'INSERT INTO customers (id, user_id, name, address, zipcode_city, kvk_number, btw_number, iban, email) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-          ).bind(
-            id, userId, data.name.trim(), data.address.trim(),
-            data.zipcode_city || null, data.kvk_number || null,
-            data.btw_number || null, data.iban || null, data.email || null
-          ).run();
+          ).bind(id, userId, data.name.trim(), data.address.trim(), data.zipcode_city || null, data.kvk_number || null, data.btw_number || null, data.iban || null, data.email || null).run();
           return jsonResponse({ message: 'Klant opgeslagen', id }, 200, request);
         }
       }
@@ -376,37 +367,81 @@ export default {
         return jsonResponse({ message: 'Klant verwijderd' }, 200, request);
       }
 
-      // --- FACTUUR AANMAKEN ---
-      if (request.method === "POST" && path === "/api/invoices") {
-        if (!userRecord.plan_factuur) {
-          const countResult = await env.DB.prepare('SELECT COUNT(*) as count FROM invoices WHERE user_id = ?').bind(userId).first();
-          if ((countResult?.count || 0) >= 3) {
-            return jsonResponse({ error: 'Demo limiet bereikt (max 3 facturen). Upgrade je account.' }, 403, request);
+      // ==========================================
+      // --- FACTUREN ---
+      // ==========================================
+
+      // Lijst / aanmaken
+      if (path === "/api/invoices") {
+        if (request.method === "POST") {
+          if (!userRecord.plan_factuur) {
+            const countResult = await env.DB.prepare('SELECT COUNT(*) as count FROM invoices WHERE user_id = ?').bind(userId).first();
+            if ((countResult?.count || 0) >= 3) {
+              return jsonResponse({ error: 'Demo limiet bereikt (max 3 facturen). Upgrade je account.' }, 403, request);
+            }
           }
+          const inv = await request.json();
+          const invId = crypto.randomUUID();
+          const dueDate = inv.due_date || inv.issue_date;
+          await env.DB.prepare(`
+            INSERT INTO invoices (id, user_id, invoice_number, issue_date, due_date, status,
+              customer_name, customer_address, customer_zipcode_city, customer_email, customer_kvk, customer_btw,
+              subtotal, vat_total, total, template_id, notes, lines_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            invId, userId, inv.invoice_number, inv.issue_date, dueDate, inv.status,
+            inv.customer_name, inv.customer_address || null, inv.customer_zipcode_city || null,
+            inv.customer_email || null, inv.customer_kvk || null, inv.customer_btw || null,
+            inv.subtotal, inv.vat_total, inv.total, inv.template_id,
+            inv.notes || null, JSON.stringify(inv.lines || [])
+          ).run();
+          return jsonResponse({ message: 'Factuur opgeslagen', id: invId }, 200, request);
         }
-
-        const inv = await request.json();
-        const invId = crypto.randomUUID();
-        const dueDate = inv.due_date || inv.issue_date;
-
-        await env.DB.prepare(`
-          INSERT INTO invoices (
-            id, user_id, invoice_number, issue_date, due_date, status,
-            customer_name, customer_address, customer_zipcode_city, customer_email, customer_kvk, customer_btw,
-            subtotal, vat_total, total, template_id, notes, lines_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(
-          invId, userId, inv.invoice_number, inv.issue_date, dueDate, inv.status,
-          inv.customer_name, inv.customer_address || null, inv.customer_zipcode_city || null,
-          inv.customer_email || null, inv.customer_kvk || null, inv.customer_btw || null,
-          inv.subtotal, inv.vat_total, inv.total, inv.template_id,
-          inv.notes || null, JSON.stringify(inv.lines || [])
-        ).run();
-
-        return jsonResponse({ message: 'Factuur opgeslagen', id: invId }, 200, request);
       }
 
-      // --- FACTUUR STATUS UPDATEN ---
+      // Enkelvoudige factuur — lezen, bewerken, verwijderen
+      if (path.match(/^\/api\/invoices\/[^/]+$/) && !path.endsWith('/status')) {
+        const invoiceId = path.split("/")[3];
+
+        if (request.method === "GET") {
+          const inv = await env.DB.prepare('SELECT * FROM invoices WHERE id = ? AND user_id = ?').bind(invoiceId, userId).first();
+          if (!inv) return jsonResponse({ error: 'Factuur niet gevonden' }, 404, request);
+          return jsonResponse({ invoice: { ...inv, lines: JSON.parse(inv.lines_json || '[]') } }, 200, request);
+        }
+
+        if (request.method === "PUT") {
+          if (!userRecord.plan_factuur) {
+            return jsonResponse({ error: 'Premium vereist om facturen te bewerken.' }, 403, request);
+          }
+          const inv = await request.json();
+          const dueDate = inv.due_date || inv.issue_date;
+          await env.DB.prepare(`
+            UPDATE invoices SET
+              invoice_number=?, issue_date=?, due_date=?, status=?,
+              customer_name=?, customer_address=?, customer_zipcode_city=?, customer_email=?, customer_kvk=?, customer_btw=?,
+              subtotal=?, vat_total=?, total=?, template_id=?, notes=?, lines_json=?
+            WHERE id=? AND user_id=?
+          `).bind(
+            inv.invoice_number, inv.issue_date, dueDate, inv.status,
+            inv.customer_name, inv.customer_address || null, inv.customer_zipcode_city || null,
+            inv.customer_email || null, inv.customer_kvk || null, inv.customer_btw || null,
+            inv.subtotal, inv.vat_total, inv.total, inv.template_id,
+            inv.notes || null, JSON.stringify(inv.lines || []),
+            invoiceId, userId
+          ).run();
+          return jsonResponse({ message: 'Factuur bijgewerkt' }, 200, request);
+        }
+
+        if (request.method === "DELETE") {
+          if (!userRecord.plan_factuur) {
+            return jsonResponse({ error: 'Premium vereist om facturen te verwijderen.' }, 403, request);
+          }
+          await env.DB.prepare('DELETE FROM invoices WHERE id = ? AND user_id = ?').bind(invoiceId, userId).run();
+          return jsonResponse({ message: 'Factuur verwijderd' }, 200, request);
+        }
+      }
+
+      // Status updaten
       if (request.method === "PUT" && path.match(/^\/api\/invoices\/[^/]+\/status$/)) {
         const invoiceId = path.split("/")[3];
         const { status } = await request.json();
@@ -414,6 +449,229 @@ export default {
         if (!validStatuses.includes(status)) return jsonResponse({ error: 'Ongeldige status' }, 400, request);
         await env.DB.prepare('UPDATE invoices SET status = ? WHERE id = ? AND user_id = ?').bind(status, invoiceId, userId).run();
         return jsonResponse({ message: 'Status aangepast' }, 200, request);
+      }
+
+      // ==========================================
+      // 3. PLANNER ROUTES
+      // ==========================================
+      if (path.startsWith('/api/planner/')) {
+        const isPlannerPremium = Boolean(userRecord.plan_planner);
+
+        // ── SERVICES ──────────────────────────────────────────────
+        if (path === '/api/planner/services') {
+          if (request.method === 'GET') {
+            const { results } = await env.DB.prepare(
+              'SELECT * FROM planner_services WHERE user_id = ? ORDER BY naam ASC'
+            ).bind(userId).all();
+            return jsonResponse({ services: results }, 200, request);
+          }
+          if (request.method === 'POST') {
+            const data = await request.json();
+            if (!data.naam?.trim()) return jsonResponse({ error: 'Naam is verplicht' }, 400, request);
+            // Gratis: max 1 dienst
+            if (!isPlannerPremium) {
+              const count = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_services WHERE user_id = ?').bind(userId).first();
+              if ((count?.c || 0) >= 1) return jsonResponse({ error: 'Max 1 dienst op gratis account.', upgrade: true }, 403, request);
+            }
+            const id = crypto.randomUUID();
+            await env.DB.prepare(
+              'INSERT INTO planner_services (id, user_id, naam, duur_in_minuten, prijs, kleur, beschrijving) VALUES (?, ?, ?, ?, ?, ?, ?)'
+            ).bind(id, userId, data.naam.trim(), data.duur_in_minuten || 60, data.prijs || 0, data.kleur || '#4f46e5', data.beschrijving || null).run();
+            return jsonResponse({ message: 'Dienst opgeslagen', id }, 200, request);
+          }
+        }
+
+        if (path.match(/^\/api\/planner\/services\/[^/]+$/) && request.method === 'DELETE') {
+          const id = path.split('/')[4];
+          await env.DB.prepare('DELETE FROM planner_services WHERE id = ? AND user_id = ?').bind(id, userId).run();
+          return jsonResponse({ message: 'Dienst verwijderd' }, 200, request);
+        }
+
+        // ── STAFF ─────────────────────────────────────────────────
+        if (path === '/api/planner/staff') {
+          if (request.method === 'GET') {
+            const { results } = await env.DB.prepare(
+              'SELECT * FROM planner_staff WHERE user_id = ? ORDER BY naam ASC'
+            ).bind(userId).all();
+            return jsonResponse({ staff: results }, 200, request);
+          }
+          if (request.method === 'POST') {
+            const data = await request.json();
+            if (!data.naam?.trim()) return jsonResponse({ error: 'Naam is verplicht' }, 400, request);
+            if (!isPlannerPremium) {
+              const count = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_staff WHERE user_id = ?').bind(userId).first();
+              if ((count?.c || 0) >= 1) return jsonResponse({ error: 'Max 1 medewerker op gratis account.', upgrade: true }, 403, request);
+            }
+            const id = crypto.randomUUID();
+            await env.DB.prepare(
+              'INSERT INTO planner_staff (id, user_id, naam, functie, kleur) VALUES (?, ?, ?, ?, ?)'
+            ).bind(id, userId, data.naam.trim(), data.functie || null, data.kleur || '#06b6d4').run();
+            return jsonResponse({ message: 'Medewerker toegevoegd', id }, 200, request);
+          }
+        }
+
+        if (path.match(/^\/api\/planner\/staff\/[^/]+$/) && request.method === 'DELETE') {
+          const id = path.split('/')[4];
+          await env.DB.prepare('DELETE FROM planner_staff WHERE id = ? AND user_id = ?').bind(id, userId).run();
+          return jsonResponse({ message: 'Medewerker verwijderd' }, 200, request);
+        }
+
+        // ── APPOINTMENTS ──────────────────────────────────────────
+        if (path === '/api/planner/appointments') {
+          if (request.method === 'GET') {
+            const van = url.searchParams.get('van') || new Date().toISOString().split('T')[0];
+            const tot = url.searchParams.get('tot') || van;
+            const { results } = await env.DB.prepare(
+              'SELECT * FROM planner_appointments WHERE user_id = ? AND datum >= ? AND datum <= ? ORDER BY datum ASC, start_tijd ASC'
+            ).bind(userId, van, tot).all();
+            return jsonResponse({ appointments: results }, 200, request);
+          }
+          if (request.method === 'POST') {
+            const data = await request.json();
+            if (!data.service_id || !data.klant_naam?.trim() || !data.datum || !data.start_tijd) {
+              return jsonResponse({ error: 'service_id, klant_naam, datum en start_tijd zijn verplicht' }, 400, request);
+            }
+            // Bereken eind_tijd op basis van service duur
+            const svc = await env.DB.prepare('SELECT duur_in_minuten, naam, kleur FROM planner_services WHERE id = ? AND user_id = ?').bind(data.service_id, userId).first();
+            const stf = data.staff_id ? await env.DB.prepare('SELECT naam FROM planner_staff WHERE id = ? AND user_id = ?').bind(data.staff_id, userId).first() : null;
+            const [h, m] = (data.start_tijd || '09:00').split(':').map(Number);
+            const endMin = h * 60 + m + (svc?.duur_in_minuten || 60);
+            const eind_tijd = `${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
+            const id = crypto.randomUUID();
+            const token = crypto.randomUUID();
+            await env.DB.prepare(`
+              INSERT INTO planner_appointments
+                (id, user_id, service_id, staff_id, klant_naam, klant_email, klant_telefoon, datum, start_tijd, eind_tijd,
+                 service_naam, service_kleur, staff_naam, status, notitie, cancellation_token)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bevestigd', ?, ?)
+            `).bind(
+              id, userId, data.service_id, data.staff_id || null,
+              data.klant_naam.trim(), data.klant_email || null, data.klant_telefoon || null,
+              data.datum, data.start_tijd, eind_tijd,
+              svc?.naam || '', svc?.kleur || '#4f46e5', stf?.naam || null,
+              data.notitie || null, token
+            ).run();
+            return jsonResponse({ message: 'Afspraak toegevoegd', id }, 200, request);
+          }
+        }
+
+        if (path.match(/^\/api\/planner\/appointments\/[^/]+$/) && request.method === 'DELETE') {
+          const id = path.split('/')[4];
+          await env.DB.prepare('DELETE FROM planner_appointments WHERE id = ? AND user_id = ?').bind(id, userId).run();
+          return jsonResponse({ message: 'Afspraak verwijderd' }, 200, request);
+        }
+
+        if (path.match(/^\/api\/planner\/appointments\/[^/]+\/status$/) && request.method === 'PUT') {
+          const id = path.split('/')[4];
+          const { status } = await request.json();
+          const valid = ['bevestigd', 'geannuleerd', 'no-show', 'voltooid'];
+          if (!valid.includes(status)) return jsonResponse({ error: 'Ongeldige status' }, 400, request);
+          await env.DB.prepare('UPDATE planner_appointments SET status = ? WHERE id = ? AND user_id = ?').bind(status, id, userId).run();
+          return jsonResponse({ message: 'Status bijgewerkt' }, 200, request);
+        }
+
+        // ── TIMESLOTS ─────────────────────────────────────────────
+        if (path === '/api/planner/timeslots') {
+          if (request.method === 'GET') {
+            const van = url.searchParams.get('van') || new Date().toISOString().split('T')[0];
+            const tot = url.searchParams.get('tot') || van;
+            const { results } = await env.DB.prepare(
+              'SELECT * FROM planner_timeslots WHERE user_id = ? AND datum >= ? AND datum <= ? ORDER BY datum ASC, start_tijd ASC'
+            ).bind(userId, van, tot).all();
+            return jsonResponse({ slots: results }, 200, request);
+          }
+          if (request.method === 'POST') {
+            const data = await request.json();
+            if (!data.datum || !data.start_tijd || !data.eind_tijd) {
+              return jsonResponse({ error: 'datum, start_tijd en eind_tijd zijn verplicht' }, 400, request);
+            }
+            if (data.start_tijd >= data.eind_tijd) {
+              return jsonResponse({ error: 'Starttijd moet vóór eindtijd liggen' }, 400, request);
+            }
+            const id = crypto.randomUUID();
+            await env.DB.prepare(
+              'INSERT INTO planner_timeslots (id, user_id, datum, start_tijd, eind_tijd, staff_id) VALUES (?, ?, ?, ?, ?, ?)'
+            ).bind(id, userId, data.datum, data.start_tijd, data.eind_tijd, data.staff_id || null).run();
+            return jsonResponse({ message: 'Tijdslot toegevoegd', id }, 200, request);
+          }
+        }
+
+        if (path.match(/^\/api\/planner\/timeslots\/[^/]+$/) && request.method === 'DELETE') {
+          const id = path.split('/')[4];
+          await env.DB.prepare('DELETE FROM planner_timeslots WHERE id = ? AND user_id = ?').bind(id, userId).run();
+          return jsonResponse({ message: 'Tijdslot verwijderd' }, 200, request);
+        }
+
+        // ── SETTINGS ──────────────────────────────────────────────
+        if (path === '/api/planner/settings') {
+          if (request.method === 'GET') {
+            const settings = await env.DB.prepare('SELECT * FROM planner_settings WHERE user_id = ?').bind(userId).first() || {};
+            const { results: availabilities } = await env.DB.prepare(
+              'SELECT * FROM planner_availabilities WHERE user_id = ? ORDER BY dag_van_de_week ASC'
+            ).bind(userId).all();
+            return jsonResponse({ settings, availabilities }, 200, request);
+          }
+          if (request.method === 'PUT') {
+            const data = await request.json();
+            if (!data.publieke_url_slug?.trim()) {
+              return jsonResponse({ error: 'URL slug is verplicht' }, 400, request);
+            }
+            // Slug uniciteit controleren (andere users)
+            const slugCheck = await env.DB.prepare(
+              'SELECT user_id FROM planner_settings WHERE publieke_url_slug = ? AND user_id != ?'
+            ).bind(data.publieke_url_slug.trim(), userId).first();
+            if (slugCheck) return jsonResponse({ error: 'Deze URL slug is al in gebruik' }, 409, request);
+
+            await env.DB.prepare(`
+              INSERT INTO planner_settings
+                (user_id, publieke_url_slug, bedrijfs_naam, bedrijfs_beschrijving, slot_interval, availability_mode, max_days_vooruit, google_calendar_enabled)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(user_id) DO UPDATE SET
+                publieke_url_slug=excluded.publieke_url_slug,
+                bedrijfs_naam=excluded.bedrijfs_naam,
+                bedrijfs_beschrijving=excluded.bedrijfs_beschrijving,
+                slot_interval=excluded.slot_interval,
+                availability_mode=excluded.availability_mode,
+                max_days_vooruit=excluded.max_days_vooruit
+            `).bind(
+              userId, data.publieke_url_slug.trim(), data.bedrijfs_naam || null,
+              data.bedrijfs_beschrijving || null, data.slot_interval || 15,
+              data.availability_mode || 'recurring', data.max_days_vooruit || 30,
+              data.google_calendar_enabled ? 1 : 0
+            ).run();
+
+            // Beschikbaarheden opslaan
+            if (Array.isArray(data.availabilities)) {
+              await env.DB.prepare('DELETE FROM planner_availabilities WHERE user_id = ?').bind(userId).run();
+              for (const avail of data.availabilities) {
+                await env.DB.prepare(
+                  'INSERT INTO planner_availabilities (id, user_id, dag_van_de_week, start_tijd, eind_tijd, is_beschikbaar) VALUES (?, ?, ?, ?, ?, ?)'
+                ).bind(crypto.randomUUID(), userId, avail.dag_van_de_week, avail.start_tijd, avail.eind_tijd, avail.is_beschikbaar ? 1 : 0).run();
+              }
+            }
+
+            return jsonResponse({ message: 'Planner instellingen opgeslagen' }, 200, request);
+          }
+        }
+
+        // ── GOOGLE CALENDAR (stub) ────────────────────────────────
+        if (path === '/api/planner/google/auth-url' && request.method === 'GET') {
+          if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+            return jsonResponse({ error: 'Google Calendar is niet geconfigureerd op deze server.' }, 501, request);
+          }
+          const redirectUri = `${url.origin}/api/planner/google/callback`;
+          const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${env.GOOGLE_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=https://www.googleapis.com/auth/calendar&access_type=offline&prompt=consent&state=${userId}`;
+          return jsonResponse({ auth_url: authUrl }, 200, request);
+        }
+
+        if (path === '/api/planner/google/disconnect' && request.method === 'POST') {
+          await env.DB.prepare(
+            'UPDATE planner_settings SET google_calendar_enabled=0, google_access_token=NULL, google_refresh_token=NULL WHERE user_id=?'
+          ).bind(userId).run();
+          return jsonResponse({ message: 'Google Calendar ontkoppeld' }, 200, request);
+        }
+
+        return jsonResponse({ error: 'Planner route niet gevonden' }, 404, request);
       }
 
       return jsonResponse({ error: 'Route niet gevonden' }, 404, request);
