@@ -356,6 +356,7 @@ export default {
         }
 
         // ── GET /api/public/booking/:slug — info + diensten + medewerkers ──
+// ── GET /api/public/booking/:slug — info + diensten + medewerkers ──
         if (!sub && request.method === 'GET') {
           const { results: services } = await env.DB.prepare(
             'SELECT id, naam, duur_in_minuten, prijs, kleur, beschrijving FROM planner_services WHERE user_id = ? ORDER BY naam ASC'
@@ -369,16 +370,25 @@ export default {
             'SELECT dag_van_de_week, start_tijd, eind_tijd, is_beschikbaar FROM planner_availabilities WHERE user_id = ? ORDER BY dag_van_de_week ASC'
           ).bind(userId).all();
 
+          // Nieuw: Haal ook de bezette tijden op voor de kalender
+          const { results: booked_slots } = await env.DB.prepare(
+            "SELECT datum, start_tijd, eind_tijd, staff_id FROM planner_appointments WHERE user_id = ? AND status != 'geannuleerd' AND datum >= date('now')"
+          ).bind(userId).all();
+
           return jsonResponse({
-            bedrijfs_naam:         settings.bedrijfs_naam || '',
-            bedrijfs_beschrijving: settings.bedrijfs_beschrijving || '',
-            slug:                  settings.publieke_url_slug,
-            slot_interval:         settings.slot_interval || 15,
-            max_days_vooruit:      settings.max_days_vooruit || 30,
-            availability_mode:     settings.availability_mode || 'recurring',
+            settings: { // <-- Netjes verpakt in 'settings' zoals React verwacht
+              bedrijfs_naam:         settings.bedrijfs_naam || '',
+              bedrijfs_beschrijving: settings.bedrijfs_beschrijving || '',
+              slot_interval:         settings.slot_interval || 15,
+              max_days_vooruit:      settings.max_days_vooruit || 30,
+              availability_mode:     settings.availability_mode || 'recurring',
+            },
+            slug: settings.publieke_url_slug,
+            is_premium: Boolean(user.plan_planner), // <-- Voeg is_premium toe
             services,
             staff,
             availabilities,
+            booked_slots, // <-- Voeg bezette slots toe
           }, 200, request);
         }
 
