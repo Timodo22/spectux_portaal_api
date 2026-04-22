@@ -1,19 +1,16 @@
 // ==========================================
-// SPECTUX PORTAAL WORKER — v3
+// SPECTUX PORTAAL WORKER — v4
 // ==========================================
-// Nieuw in v3:
-//   POST/GET/DELETE /api/planner/services
-//   POST/GET/DELETE /api/planner/staff
-//   POST/GET/DELETE /api/planner/appointments
-//   PUT             /api/planner/appointments/:id/status
-//   POST/GET/DELETE /api/planner/timeslots
-//   GET/PUT         /api/planner/settings
-//   GET             /api/planner/google/auth-url  (stub)
-//   POST            /api/planner/google/disconnect
-//   DELETE          /api/invoices/:id
-//   GET             /api/invoices/:id
-//   PUT             /api/invoices/:id   (bewerken)
-//   scheduled       → verwijdert planner data ouder dan 10 dagen
+// Nieuw in v4:
+//   - Logo uit user_settings op publieke boekingspagina
+//   - time_slots & available_dates in public booking GET
+//   - Klanten automatisch opslaan bij publieke boeking
+//   - Anti-spam rate limiting (5 boekingen/IP/uur/slug)
+//   - Honeypot check op publieke boeking
+//   - POST/GET/DELETE /api/planner/locations
+//   - POST/GET/DELETE /api/costs
+//   - POST /api/invoices/reset (kwartaal reset)
+//   - /api/dashboard includeert ook kosten-stats
 // ==========================================
 
 const generateCode = () => Math.floor(100000 + Math.random() * 900000).toString();
@@ -26,6 +23,7 @@ async function hashPassword(password) {
 }
 
 async function sendEmail(apiKey, to, subject, html) {
+  if (!apiKey) return false;
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -55,13 +53,42 @@ function jsonResponse(body, status, request) {
   });
 }
 
+// ── Rate limiting: max 5 bookings per IP per slug per hour ──────────────────
+async function checkRateLimit(env, ip, slug) {
+  const window = Math.floor(Date.now() / (1000 * 60 * 60)); // current hour bucket
+  const key = `${ip}:${slug}:${window}`;
+  try {
+    // Clean up old windows (> 2 hours old)
+    await env.DB.prepare('DELETE FROM booking_rate_limits WHERE window_start < ?').bind(window - 2).run();
+
+    const existing = await env.DB.prepare(
+      'SELECT count FROM booking_rate_limits WHERE rate_key = ?'
+    ).bind(key).first();
+
+    if (existing) {
+      if (existing.count >= 5) return false;
+      await env.DB.prepare('UPDATE booking_rate_limits SET count = count + 1 WHERE rate_key = ?').bind(key).run();
+    } else {
+      await env.DB.prepare(
+        'INSERT INTO booking_rate_limits (rate_key, count, window_start) VALUES (?, 1, ?)'
+      ).bind(key, window).run();
+    }
+    return true;
+  } catch {
+    return true; // allow on DB error
+  }
+}
+
+// ── Get IP from request ────────────────────────────────────────────────────
+function getIP(request) {
+  return request.headers.get('CF-Connecting-IP') ||
+         request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
+         '0.0.0.0';
+}
+
 export default {
   // ──────────────────────────────────────────────
-  // SCHEDULED: elke dag om 03:00 UTC
-  // Verwijdert planner data ouder dan 10 dagen
-  // Voeg in wrangler.toml toe:
-  //   [triggers]
-  //   crons = ["0 3 * * *"]
+  // SCHEDULED cleanup
   // ──────────────────────────────────────────────
   async scheduled(event, env, ctx) {
     const cutoff = new Date();
@@ -70,6 +97,9 @@ export default {
     try {
       await env.DB.prepare('DELETE FROM planner_appointments WHERE datum < ?').bind(cutoffStr).run();
       await env.DB.prepare('DELETE FROM planner_timeslots WHERE datum < ?').bind(cutoffStr).run();
+      await env.DB.prepare('DELETE FROM booking_rate_limits WHERE window_start < ?').bind(
+        Math.floor(Date.now() / (1000 * 60 * 60)) - 48
+      ).run();
       console.log(`[cleanup] Verwijderd planner data vóór ${cutoffStr}`);
     } catch (e) {
       console.error('[cleanup] Fout:', e.message);
@@ -102,51 +132,37 @@ export default {
           const { results: users } = await env.DB.prepare(
             'SELECT id, name, email, is_verified, plan_factuur, plan_planner, created_at FROM users ORDER BY created_at DESC'
           ).all();
-
           const usersWithStats = await Promise.all(users.map(async (user) => {
             const invoiceCount = await env.DB.prepare('SELECT COUNT(*) as count FROM invoices WHERE user_id = ?').bind(user.id).first();
             const customerCount = await env.DB.prepare('SELECT COUNT(*) as count FROM customers WHERE user_id = ?').bind(user.id).first();
             const totalInvoiced = await env.DB.prepare('SELECT SUM(total) as sum FROM invoices WHERE user_id = ?').bind(user.id).first();
-            return {
-              ...user,
-              invoice_count: invoiceCount?.count || 0,
-              customer_count: customerCount?.count || 0,
-              total_invoiced: totalInvoiced?.sum || 0,
-            };
+            return { ...user, invoice_count: invoiceCount?.count || 0, customer_count: customerCount?.count || 0, total_invoiced: totalInvoiced?.sum || 0 };
           }));
-
           return jsonResponse({ users: usersWithStats }, 200, request);
         }
 
         if (path === '/api/portal-admin/stats' && request.method === 'GET') {
-          const userCount = await env.DB.prepare('SELECT COUNT(*) as count FROM users').first();
-          const verifiedCount = await env.DB.prepare('SELECT COUNT(*) as count FROM users WHERE is_verified = 1').first();
-          const premiumCount = await env.DB.prepare('SELECT COUNT(*) as count FROM users WHERE plan_factuur = 1').first();
-          const invoiceCount = await env.DB.prepare('SELECT COUNT(*) as count FROM invoices').first();
-          const customerCount = await env.DB.prepare('SELECT COUNT(*) as count FROM customers').first();
-          const totalRevenue = await env.DB.prepare("SELECT COALESCE(SUM(total), 0) as total FROM invoices WHERE status = 'Betaald'").first();
-          const openRevenue = await env.DB.prepare("SELECT COALESCE(SUM(total), 0) as total FROM invoices WHERE status = 'Openstaand'").first();
+          const userCount      = await env.DB.prepare('SELECT COUNT(*) as count FROM users').first();
+          const verifiedCount  = await env.DB.prepare('SELECT COUNT(*) as count FROM users WHERE is_verified = 1').first();
+          const premiumCount   = await env.DB.prepare('SELECT COUNT(*) as count FROM users WHERE plan_factuur = 1').first();
+          const invoiceCount   = await env.DB.prepare('SELECT COUNT(*) as count FROM invoices').first();
+          const customerCount  = await env.DB.prepare('SELECT COUNT(*) as count FROM customers').first();
+          const totalRevenue   = await env.DB.prepare("SELECT COALESCE(SUM(total), 0) as total FROM invoices WHERE status = 'Betaald'").first();
+          const openRevenue    = await env.DB.prepare("SELECT COALESCE(SUM(total), 0) as total FROM invoices WHERE status = 'Openstaand'").first();
           const invoicesByStatus = await env.DB.prepare('SELECT status, COUNT(*) as count FROM invoices GROUP BY status').all();
-
           return jsonResponse({
-            users: userCount?.count || 0,
-            verified_users: verifiedCount?.count || 0,
-            premium_users: premiumCount?.count || 0,
-            invoices: invoiceCount?.count || 0,
-            customers: customerCount?.count || 0,
-            total_revenue_paid: totalRevenue?.total || 0,
-            total_revenue_open: openRevenue?.total || 0,
-            invoices_by_status: invoicesByStatus?.results || [],
+            users: userCount?.count || 0, verified_users: verifiedCount?.count || 0,
+            premium_users: premiumCount?.count || 0, invoices: invoiceCount?.count || 0,
+            customers: customerCount?.count || 0, total_revenue_paid: totalRevenue?.total || 0,
+            total_revenue_open: openRevenue?.total || 0, invoices_by_status: invoicesByStatus?.results || [],
           }, 200, request);
         }
 
         if (path === '/api/portal-admin/invoices' && request.method === 'GET') {
           const { results: invoices } = await env.DB.prepare(
             `SELECT i.id, i.invoice_number, i.issue_date, i.status, i.customer_name, i.total, i.subtotal, i.vat_total,
-                  u.name as user_name, u.email as user_email
-             FROM invoices i
-             JOIN users u ON i.user_id = u.id
-             ORDER BY i.created_at DESC LIMIT 200`
+                    u.name as user_name, u.email as user_email
+             FROM invoices i JOIN users u ON i.user_id = u.id ORDER BY i.created_at DESC LIMIT 200`
           ).all();
           return jsonResponse({ invoices }, 200, request);
         }
@@ -174,42 +190,21 @@ export default {
           const activeToday       = await env.DB.prepare("SELECT COUNT(*) as c FROM planner_appointments WHERE datum = date('now') AND status = 'bevestigd'").first();
           const thisWeek          = await env.DB.prepare("SELECT COUNT(*) as c FROM planner_appointments WHERE datum >= date('now') AND datum <= date('now','+7 days')").first();
           const byStatus          = await env.DB.prepare("SELECT status, COUNT(*) as count FROM planner_appointments GROUP BY status").all();
-          const topUsers          = await env.DB.prepare(`
-            SELECT u.id, u.name, u.email, u.plan_planner,
-              (SELECT COUNT(*) FROM planner_appointments a WHERE a.user_id = u.id) as appt_count,
-              (SELECT COUNT(*) FROM planner_services s WHERE s.user_id = u.id) as service_count,
-              (SELECT COUNT(*) FROM planner_staff st WHERE st.user_id = u.id) as staff_count,
-              (SELECT publieke_url_slug FROM planner_settings ps WHERE ps.user_id = u.id) as slug
-            FROM users u
-            WHERE u.plan_planner = 1 OR (SELECT COUNT(*) FROM planner_services WHERE user_id = u.id) > 0
-            ORDER BY appt_count DESC
-            LIMIT 20
-          `).all();
-
           return jsonResponse({
-            total_services:      totalServices?.c || 0,
-            total_staff:         totalStaff?.c || 0,
-            total_appointments:  totalAppointments?.c || 0,
-            total_timeslots:     totalTimeslots?.c || 0,
-            planner_premium:     plannerPremium?.c || 0,
-            active_today:        activeToday?.c || 0,
-            this_week:           thisWeek?.c || 0,
-            by_status:           byStatus?.results || [],
-            top_users:           topUsers?.results || [],
+            total_services: totalServices?.c || 0, total_staff: totalStaff?.c || 0,
+            total_appointments: totalAppointments?.c || 0, total_timeslots: totalTimeslots?.c || 0,
+            planner_premium: plannerPremium?.c || 0, active_today: activeToday?.c || 0,
+            this_week: thisWeek?.c || 0, by_status: byStatus?.results || [],
           }, 200, request);
         }
 
         if (path.match(/^\/api\/portal-admin\/users\/[^/]+$/) && request.method === 'DELETE') {
           const userId = path.split('/')[4];
-          await env.DB.prepare('DELETE FROM invoices WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM customers WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM user_settings WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM planner_appointments WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM planner_timeslots WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM planner_services WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM planner_staff WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM planner_availabilities WHERE user_id = ?').bind(userId).run();
-          await env.DB.prepare('DELETE FROM planner_settings WHERE user_id = ?').bind(userId).run();
+          for (const table of ['invoices','customers','user_settings','planner_appointments','planner_timeslots',
+              'planner_services','planner_staff','planner_availabilities','planner_settings',
+              'planner_locations','costs']) {
+            await env.DB.prepare(`DELETE FROM ${table} WHERE user_id = ?`).bind(userId).run().catch(() => {});
+          }
           await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
           return jsonResponse({ message: 'Gebruiker en alle data verwijderd' }, 200, request);
         }
@@ -225,43 +220,22 @@ export default {
         if (!internalSecret || internalSecret !== (env.INTERNAL_SECRET || '')) {
           return jsonResponse({ error: 'Intern endpoint: toegang geweigerd' }, 401, request);
         }
-
-        const { email, name, password_hash, is_new_user, plan } = await request.json();
+        const { email, name, password_hash, plan } = await request.json();
         const normalizedEmail = email.toLowerCase().trim();
-
         const existingUser = await env.DB.prepare('SELECT id, plan_factuur FROM users WHERE email = ?').bind(normalizedEmail).first();
-
         if (existingUser) {
           await env.DB.prepare('UPDATE users SET plan_factuur = 1 WHERE id = ?').bind(existingUser.id).run();
-          await sendEmail(
-            env.RESEND_API_KEY, normalizedEmail, 'Spectux Factuur Tool geactiveerd!',
-            `<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#333">
-              <h2 style="color:#4f46e5">Factuur Tool geactiveerd 🎉</h2>
-              <p>Je Spectux Factuur Tool is geactiveerd!</p>
-              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">Open Portaal</a>
-              <p style="color:#888;font-size:13px">Vragen? Mail ons op info@spectux.com</p>
-            </div>`
-          );
-          return jsonResponse({ message: 'Plan geactiveerd voor bestaand account', user_id: existingUser.id }, 200, request);
+          await sendEmail(env.RESEND_API_KEY, normalizedEmail, 'Spectux Factuur Tool geactiveerd!',
+            `<h2 style="color:#4f46e5">Factuur Tool geactiveerd 🎉</h2><p>Je abonnement is actief.</p>
+             <a href="https://spectux.com/portaal" style="background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Open Portaal</a>`);
+          return jsonResponse({ message: 'Plan geactiveerd', user_id: existingUser.id }, 200, request);
         } else {
-          if (!password_hash || !name) {
-            return jsonResponse({ error: 'name en password_hash vereist voor nieuw account' }, 400, request);
-          }
+          if (!password_hash || !name) return jsonResponse({ error: 'name en password_hash vereist' }, 400, request);
           const newId = crypto.randomUUID();
           await env.DB.prepare(
-            `INSERT INTO users (id, name, email, password_hash, is_verified, plan_factuur, plan_planner) VALUES (?, ?, ?, ?, 1, 1, 0)`
+            'INSERT INTO users (id, name, email, password_hash, is_verified, plan_factuur, plan_planner) VALUES (?, ?, ?, ?, 1, 1, 0)'
           ).bind(newId, name.trim(), normalizedEmail, password_hash).run();
-          await sendEmail(
-            env.RESEND_API_KEY, normalizedEmail, 'Welkom bij Spectux — jouw account is klaar!',
-            `<div style="font-family:sans-serif;max-width:520px;margin:auto;color:#333">
-              <h2 style="color:#4f46e5">Welkom bij Spectux, ${name}! 🎉</h2>
-              <p>Je abonnement is actief en je Factuur Tool account staat klaar.</p>
-              <a href="https://spectux.com/portaal" style="display:inline-block;background:#4f46e5;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin:12px 0">Inloggen bij Spectux Portaal</a>
-              <p><strong>E-mail:</strong> ${normalizedEmail}</p>
-              <p style="color:#888;font-size:13px">Vragen? Mail ons op info@spectux.com</p>
-            </div>`
-          );
-          return jsonResponse({ message: 'Nieuw account aangemaakt en plan geactiveerd', user_id: newId }, 200, request);
+          return jsonResponse({ message: 'Nieuw account aangemaakt', user_id: newId }, 200, request);
         }
       }
 
@@ -269,14 +243,11 @@ export default {
       // 1. PUBLIC AUTH ROUTES
       // ==========================================
       if (path.startsWith('/api/auth/')) {
-
         if (path === '/api/auth/check-email' && request.method === 'POST') {
           const { email } = await request.json();
-          const normalizedEmail = email.toLowerCase().trim();
-          const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(normalizedEmail).first();
+          const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email.toLowerCase().trim()).first();
           return jsonResponse({ exists: !!existing }, 200, request);
         }
-
         if (request.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405, request);
 
         if (path === '/api/auth/register') {
@@ -297,8 +268,7 @@ export default {
               <p>Gebruik de onderstaande code om je account te verifiëren:</p>
               <div style="background:#f4f4f5;border-radius:8px;padding:24px;text-align:center;font-size:36px;font-weight:bold;letter-spacing:8px">${code}</div>
               <p style="color:#71717a;font-size:14px">Deze code verloopt over 15 minuten.</p>
-            </div>`
-          );
+            </div>`);
           return jsonResponse({ message: 'Code verstuurd' }, 200, request);
         }
 
@@ -322,44 +292,37 @@ export default {
           if (!user) return jsonResponse({ error: 'Ongeldige inloggegevens' }, 401, request);
           if (user.is_verified === 0) return jsonResponse({ error: 'Account is niet geverifieerd' }, 403, request);
           return jsonResponse({
-            message: 'Succesvol ingelogd',
-            token: user.id,
+            message: 'Succesvol ingelogd', token: user.id,
             user: { id: user.id, name: user.name, plans: { factuur: Boolean(user.plan_factuur), planner: Boolean(user.plan_planner) } }
           }, 200, request);
         }
       }
 
       // ==========================================
-      // PUBLIC BOOKING ROUTES (geen auth vereist)
-      // Gebruikt door spectux.com/booking/[slug]
+      // PUBLIC BOOKING ROUTES
       // ==========================================
       if (path.startsWith('/api/public/booking/')) {
-        const parts = path.split('/'); // ['','api','public','booking',slug,...rest]
+        const parts = path.split('/');
         const slug  = parts[4];
-        const sub   = parts[5]; // 'availability' | undefined
+        const sub   = parts[5];
 
         if (!slug) return jsonResponse({ error: 'Geen slug opgegeven' }, 400, request);
 
-        // Zoek user op basis van slug
         const settings = await env.DB.prepare(
           'SELECT * FROM planner_settings WHERE publieke_url_slug = ?'
         ).bind(slug).first();
-
         if (!settings) return jsonResponse({ error: 'Boekingspagina niet gevonden' }, 404, request);
 
         const userId = settings.user_id;
-
-        // Check of user premium planner heeft
-        const user = await env.DB.prepare('SELECT plan_planner FROM users WHERE id = ?').bind(userId).first();
+        const user   = await env.DB.prepare('SELECT plan_planner FROM users WHERE id = ?').bind(userId).first();
         if (!user?.plan_planner) {
           return jsonResponse({ error: 'Deze boekingspagina is niet actief.' }, 403, request);
         }
 
-        // ── GET /api/public/booking/:slug — info + diensten + medewerkers ──
-// ── GET /api/public/booking/:slug — info + diensten + medewerkers ──
+        // ── GET /api/public/booking/:slug ─────────────────────────────────
         if (!sub && request.method === 'GET') {
           const { results: services } = await env.DB.prepare(
-            'SELECT id, naam, duur_in_minuten, prijs, kleur, beschrijving FROM planner_services WHERE user_id = ? ORDER BY naam ASC'
+            'SELECT id, naam, duur_in_minuten, prijs, kleur, beschrijving, location_id FROM planner_services WHERE user_id = ? ORDER BY naam ASC'
           ).bind(userId).all();
 
           const { results: staff } = await env.DB.prepare(
@@ -370,65 +333,81 @@ export default {
             'SELECT dag_van_de_week, start_tijd, eind_tijd, is_beschikbaar FROM planner_availabilities WHERE user_id = ? ORDER BY dag_van_de_week ASC'
           ).bind(userId).all();
 
-          // Nieuw: Haal ook de bezette tijden op voor de kalender
           const { results: booked_slots } = await env.DB.prepare(
             "SELECT datum, start_tijd, eind_tijd, staff_id FROM planner_appointments WHERE user_id = ? AND status != 'geannuleerd' AND datum >= date('now')"
           ).bind(userId).all();
 
+          // Custom time slots for the next max_days_vooruit days
+          const maxDays = settings.max_days_vooruit || 30;
+          const todayStr = new Date().toISOString().split('T')[0];
+          const futureDate = new Date();
+          futureDate.setDate(futureDate.getDate() + maxDays);
+          const futureStr = futureDate.toISOString().split('T')[0];
+
+          const { results: time_slots } = await env.DB.prepare(
+            'SELECT datum, start_tijd, eind_tijd, staff_id FROM planner_timeslots WHERE user_id = ? AND datum >= ? AND datum <= ? ORDER BY datum ASC, start_tijd ASC'
+          ).bind(userId, todayStr, futureStr).all();
+
+          // Get available dates for calendar (distinct dates with time slots)
+          const available_dates = [...new Set(time_slots.map(s => s.datum))];
+
+          // Locations
+          const { results: locations } = await env.DB.prepare(
+            'SELECT id, naam, adres, stad, kleur FROM planner_locations WHERE user_id = ? ORDER BY naam ASC'
+          ).bind(userId).all();
+
+          // Logo from user_settings
+          const userSettings = await env.DB.prepare(
+            'SELECT logo_base64, company_name FROM user_settings WHERE user_id = ?'
+          ).bind(userId).first();
+
           return jsonResponse({
-            settings: { // <-- Netjes verpakt in 'settings' zoals React verwacht
-              bedrijfs_naam:         settings.bedrijfs_naam || '',
+            settings: {
+              bedrijfs_naam:         settings.bedrijfs_naam || userSettings?.company_name || '',
               bedrijfs_beschrijving: settings.bedrijfs_beschrijving || '',
               slot_interval:         settings.slot_interval || 15,
-              max_days_vooruit:      settings.max_days_vooruit || 30,
-              availability_mode:     settings.availability_mode || 'recurring',
+              max_days_vooruit:      maxDays,
+              availability_mode:     settings.availability_mode || 'custom_slots',
+              logo_base64:           userSettings?.logo_base64 || null,
             },
             slug: settings.publieke_url_slug,
-            is_premium: Boolean(user.plan_planner), // <-- Voeg is_premium toe
-            services,
-            staff,
-            availabilities,
-            booked_slots, // <-- Voeg bezette slots toe
+            is_premium: Boolean(user.plan_planner),
+            services, staff, availabilities, booked_slots,
+            time_slots, available_dates, locations,
           }, 200, request);
         }
 
-        // ── GET /api/public/booking/:slug/availability?datum=YYYY-MM-DD ──
-        // Geeft beschikbare tijdsloten terug op een specifieke datum
+        // ── GET /api/public/booking/:slug/availability ────────────────────
         if (sub === 'availability' && request.method === 'GET') {
-          const datum = url.searchParams.get('datum');
+          const datum     = url.searchParams.get('datum');
           const serviceId = url.searchParams.get('service_id');
           if (!datum) return jsonResponse({ error: 'datum parameter vereist' }, 400, request);
 
-          // Duur van de dienst ophalen
           let duur = settings.slot_interval || 15;
           if (serviceId) {
             const svc = await env.DB.prepare('SELECT duur_in_minuten FROM planner_services WHERE id = ? AND user_id = ?').bind(serviceId, userId).first();
             if (svc) duur = svc.duur_in_minuten;
           }
 
-          // Bestaande afspraken op die datum
           const { results: bestaandeAfspraken } = await env.DB.prepare(
             "SELECT start_tijd, eind_tijd FROM planner_appointments WHERE user_id = ? AND datum = ? AND status != 'geannuleerd'"
           ).bind(userId, datum).all();
-
           const bezet = bestaandeAfspraken.map(a => ({ start: a.start_tijd, eind: a.eind_tijd }));
 
-          // Helper: minuten naar "HH:MM"
           const minToTime = (m) => `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
           const timeToMin = (t) => { const [h,m] = t.split(':').map(Number); return h*60+m; };
-          const overlaps = (startA, eindA, startB, eindB) => startA < eindB && eindA > startB;
+          const overlaps  = (sA, eA, sB, eB) => sA < eB && eA > sB;
 
-          let windows = []; // [{van: minutes, tot: minutes}]
+          let windows = [];
+          // Always use custom slots (default mode is now custom_slots)
+          const { results: slots } = await env.DB.prepare(
+            'SELECT start_tijd, eind_tijd FROM planner_timeslots WHERE user_id = ? AND datum = ? ORDER BY start_tijd ASC'
+          ).bind(userId, datum).all();
+          windows = slots.map(s => ({ van: timeToMin(s.start_tijd), tot: timeToMin(s.eind_tijd) }));
 
-          if (settings.availability_mode === 'custom_slots') {
-            // Gebruik tijdsloten uit DB voor deze datum
-            const { results: slots } = await env.DB.prepare(
-              'SELECT start_tijd, eind_tijd FROM planner_timeslots WHERE user_id = ? AND datum = ? ORDER BY start_tijd ASC'
-            ).bind(userId, datum).all();
-            windows = slots.map(s => ({ van: timeToMin(s.start_tijd), tot: timeToMin(s.eind_tijd) }));
-          } else {
-            // Terugkerend patroon: kijk welke dag van de week
-            const dayOfWeek = (new Date(datum).getDay() + 6) % 7; // 0=ma, 6=zo
+          // Fallback to recurring availability if no custom slots and mode is recurring
+          if (windows.length === 0 && (settings.availability_mode === 'recurring')) {
+            const dayOfWeek = (new Date(datum).getDay() + 6) % 7;
             const { results: avails } = await env.DB.prepare(
               'SELECT start_tijd, eind_tijd, is_beschikbaar FROM planner_availabilities WHERE user_id = ? AND dag_van_de_week = ?'
             ).bind(userId, dayOfWeek).all();
@@ -437,54 +416,69 @@ export default {
             }
           }
 
-          // Genereer slots per slot_interval, filter bezette
-          const interval = settings.slot_interval || 15;
+          const interval    = settings.slot_interval || 15;
           const beschikbaar = [];
-
           for (const w of windows) {
             let cur = w.van;
             while (cur + duur <= w.tot) {
-              const slotEnd = cur + duur;
-              const slotStart_str = minToTime(cur);
-              const slotEnd_str   = minToTime(slotEnd);
-              const isBezet = bezet.some(b => overlaps(cur, slotEnd, timeToMin(b.start), timeToMin(b.eind)));
-              if (!isBezet) beschikbaar.push({ start_tijd: slotStart_str, eind_tijd: slotEnd_str });
+              const slotEnd   = cur + duur;
+              const isBezet   = bezet.some(b => overlaps(cur, slotEnd, timeToMin(b.start), timeToMin(b.eind)));
+              if (!isBezet) beschikbaar.push({ start_tijd: minToTime(cur), eind_tijd: minToTime(slotEnd) });
               cur += interval;
             }
           }
-
           return jsonResponse({ datum, slots: beschikbaar }, 200, request);
         }
 
-        // ── POST /api/public/booking/:slug — nieuwe afspraak aanmaken ──
+        // ── POST /api/public/booking/:slug — nieuwe boeking ───────────────
         if (!sub && request.method === 'POST') {
-          const body = await request.json();
-          const { service_id, staff_id, klant_naam, klant_email, klant_telefoon, datum, start_tijd, notitie } = body;
-
-          if (!service_id || !klant_naam || !klant_email || !datum || !start_tijd) {
-            return jsonResponse({ error: 'Vul alle verplichte velden in (dienst, naam, email, datum, tijd)' }, 400, request);
+          // Rate limiting
+          const ip = getIP(request);
+          const allowed = await checkRateLimit(env, ip, slug);
+          if (!allowed) {
+            return jsonResponse({
+              error: 'Te veel boekingen vanuit dit IP-adres. Probeer over een uur opnieuw.'
+            }, 429, request);
           }
 
-          // Dienst ophalen
+          const body = await request.json();
+
+          // Honeypot check — bots fill hidden fields
+          if (body._hp && body._hp.trim() !== '') {
+            return jsonResponse({ error: 'Ongeldige aanvraag.' }, 400, request);
+          }
+          // Minimum time on page (< 3 seconds is likely a bot)
+          if (body._load_ms && body._load_ms < 3000) {
+            return jsonResponse({ error: 'Ongeldige aanvraag.' }, 400, request);
+          }
+
+          const { service_id, staff_id, klant_naam, klant_email, klant_telefoon, datum, start_tijd, notitie, location_id } = body;
+          if (!service_id || !klant_naam || !klant_email || !datum || !start_tijd) {
+            return jsonResponse({ error: 'Vul alle verplichte velden in' }, 400, request);
+          }
+
           const svc = await env.DB.prepare('SELECT * FROM planner_services WHERE id = ? AND user_id = ?').bind(service_id, userId).first();
           if (!svc) return jsonResponse({ error: 'Dienst niet gevonden' }, 404, request);
 
-          // Eindtijd berekenen
           const [h, m] = start_tijd.split(':').map(Number);
-          const endMin  = h * 60 + m + svc.duur_in_minuten;
+          const endMin    = h * 60 + m + svc.duur_in_minuten;
           const eind_tijd = `${String(Math.floor(endMin/60)).padStart(2,'0')}:${String(endMin%60).padStart(2,'0')}`;
 
-          // Check of slot al bezet is
           const conflict = await env.DB.prepare(
             "SELECT id FROM planner_appointments WHERE user_id=? AND datum=? AND status!='geannuleerd' AND start_tijd < ? AND eind_tijd > ?"
           ).bind(userId, datum, eind_tijd, start_tijd).first();
           if (conflict) return jsonResponse({ error: 'Dit tijdstip is helaas al bezet. Kies een ander tijdslot.' }, 409, request);
 
-          // Medewerker info
           let staff_naam = '';
           if (staff_id) {
             const stf = await env.DB.prepare('SELECT naam FROM planner_staff WHERE id = ? AND user_id = ?').bind(staff_id, userId).first();
             if (stf) staff_naam = stf.naam;
+          }
+
+          let location_naam = '';
+          if (location_id) {
+            const loc = await env.DB.prepare('SELECT naam FROM planner_locations WHERE id = ? AND user_id = ?').bind(location_id, userId).first();
+            if (loc) location_naam = loc.naam;
           }
 
           const id = crypto.randomUUID();
@@ -492,74 +486,77 @@ export default {
 
           await env.DB.prepare(`
             INSERT INTO planner_appointments
-              (id, user_id, service_id, staff_id, klant_naam, klant_email, klant_telefoon,
+              (id, user_id, service_id, staff_id, location_id, klant_naam, klant_email, klant_telefoon,
                datum, start_tijd, eind_tijd, service_naam, service_kleur, staff_naam,
                status, notitie, cancellation_token, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'bevestigd',?,?,datetime('now'))
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'bevestigd',?,?,datetime('now'))
           `).bind(
-            id, userId, service_id, staff_id || null,
+            id, userId, service_id, staff_id || null, location_id || null,
             klant_naam, klant_email, klant_telefoon || null,
-            datum, start_tijd, eind_tijd,
-            svc.naam, svc.kleur, staff_naam,
+            datum, start_tijd, eind_tijd, svc.naam, svc.kleur, staff_naam,
             notitie || null, cancellation_token
           ).run();
 
+          // ── Auto-save customer (if new email for this vendor) ───────────
+          if (klant_email) {
+            const normalizedEmail = klant_email.toLowerCase().trim();
+            const existing = await env.DB.prepare(
+              'SELECT id FROM customers WHERE user_id = ? AND email = ?'
+            ).bind(userId, normalizedEmail).first().catch(() => null);
+            if (!existing) {
+              await env.DB.prepare(
+                'INSERT INTO customers (id, user_id, name, address, zipcode_city, email) VALUES (?, ?, ?, ?, ?, ?)'
+              ).bind(crypto.randomUUID(), userId, klant_naam, '', '', normalizedEmail).run().catch(() => {});
+            }
+          }
+
           // Bevestigingsmail naar klant
           if (env.RESEND_API_KEY) {
-            const datumNL = new Date(datum).toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-            await sendEmail(
-              env.RESEND_API_KEY,
-              klant_email,
+            const datumNL = new Date(datum + 'T00:00:00').toLocaleDateString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+            await sendEmail(env.RESEND_API_KEY, klant_email,
               `Afspraakbevestiging — ${svc.naam} bij ${settings.bedrijfs_naam || 'Spectux'}`,
               `<h2>Je afspraak is bevestigd! ✅</h2>
-              <p>Hoi ${klant_naam},</p>
-              <p>Je afspraak staat gepland:</p>
-              <ul>
-                <li><strong>Dienst:</strong> ${svc.naam}</li>
-                ${staff_naam ? `<li><strong>Medewerker:</strong> ${staff_naam}</li>` : ''}
-                <li><strong>Datum:</strong> ${datumNL}</li>
-                <li><strong>Tijd:</strong> ${start_tijd} – ${eind_tijd}</li>
-                <li><strong>Locatie:</strong> ${settings.bedrijfs_naam || ''}</li>
-              </ul>
-              <p>Wil je annuleren? <a href="https://spectux.com/booking/${slug}/cancel/${cancellation_token}">Klik hier om te annuleren</a>.</p>
-              <p>Tot dan!<br/>${settings.bedrijfs_naam || 'Spectux'}</p>`
+               <p>Hoi ${klant_naam},</p>
+               <ul>
+                 <li><strong>Dienst:</strong> ${svc.naam}</li>
+                 ${staff_naam ? `<li><strong>Medewerker:</strong> ${staff_naam}</li>` : ''}
+                 ${location_naam ? `<li><strong>Locatie:</strong> ${location_naam}</li>` : ''}
+                 <li><strong>Datum:</strong> ${datumNL}</li>
+                 <li><strong>Tijd:</strong> ${start_tijd} – ${eind_tijd}</li>
+               </ul>
+               <p>Annuleren? <a href="https://spectux.com/booking/${slug}/cancel/${cancellation_token}">Klik hier</a>.</p>
+               <p>Tot dan!<br/>${settings.bedrijfs_naam || 'Spectux'}</p>`
             );
           }
 
-          return jsonResponse({
-            success: true,
-            id,
-            cancellation_token,
-            afspraak: { datum, start_tijd, eind_tijd, service_naam: svc.naam, staff_naam },
+          return jsonResponse({ success: true, id, cancellation_token,
+            afspraak: { datum, start_tijd, eind_tijd, service_naam: svc.naam, staff_naam, location_naam }
           }, 201, request);
         }
 
-        // ── GET /api/public/booking/:slug/cancel/:token — afspraak annuleren ──
+        // ── POST /api/public/booking/:slug/cancel/:token ──────────────────
         if (sub === 'cancel' && request.method === 'POST') {
           const token = parts[6];
           if (!token) return jsonResponse({ error: 'Geen token' }, 400, request);
           const appt = await env.DB.prepare(
-            "SELECT id, klant_naam, datum, start_tijd, service_naam FROM planner_appointments WHERE cancellation_token = ? AND user_id = ?"
+            "SELECT id, klant_naam, datum, start_tijd FROM planner_appointments WHERE cancellation_token = ? AND user_id = ?"
           ).bind(token, userId).first();
           if (!appt) return jsonResponse({ error: 'Afspraak niet gevonden of al geannuleerd' }, 404, request);
-          await env.DB.prepare(
-            "UPDATE planner_appointments SET status = 'geannuleerd' WHERE cancellation_token = ?"
-          ).bind(token).run();
-          return jsonResponse({ success: true, message: `Afspraak van ${appt.klant_naam} op ${appt.datum} om ${appt.start_tijd} is geannuleerd.` }, 200, request);
+          await env.DB.prepare("UPDATE planner_appointments SET status = 'geannuleerd' WHERE cancellation_token = ?").bind(token).run();
+          return jsonResponse({ success: true, message: `Afspraak van ${appt.klant_naam} geannuleerd.` }, 200, request);
         }
 
         return jsonResponse({ error: 'Route niet gevonden' }, 404, request);
       }
 
       // ==========================================
-      // 2. PROTECTED ROUTES (Beveiliging / Authenticated)
+      // 2. PROTECTED ROUTES
       // ==========================================
       const authHeader = request.headers.get("Authorization");
       if (!authHeader?.startsWith("Bearer ")) {
         return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
       }
       const userId = authHeader.split(" ")[1];
-
       const userRecord = await env.DB.prepare('SELECT id, plan_factuur, plan_planner FROM users WHERE id = ?').bind(userId).first();
       if (!userRecord) return jsonResponse({ error: 'Niet geautoriseerd' }, 401, request);
 
@@ -568,16 +565,30 @@ export default {
         const { results: invoices } = await env.DB.prepare(
           'SELECT * FROM invoices WHERE user_id = ? ORDER BY created_at DESC'
         ).bind(userId).all();
-        let stats = { openstaand: 0, betaaldDitJaar: 0, verlopen: 0, omzetExclBtw: 0, btwTeBetalen: 0 };
+
+        // Costs summary
+        const { results: costsRows } = await env.DB.prepare(
+          'SELECT bedrag_excl_btw, btw_bedrag, datum FROM costs WHERE user_id = ? ORDER BY datum DESC'
+        ).bind(userId).all();
+
+        let stats = { openstaand: 0, betaaldDitJaar: 0, verlopen: 0, omzetExclBtw: 0, btwTeBetalen: 0,
+                      kostenExclBtw: 0, btwVoorbelasting: 0, nettoWinst: 0 };
         invoices.forEach(inv => {
           if (inv.status === 'Openstaand' || inv.status === 'Offerte') stats.openstaand += inv.total || 0;
-          if (inv.status === 'Verlopen') stats.verlopen += inv.total || 0;
+          if (inv.status === 'Verlopen')   stats.verlopen       += inv.total    || 0;
           if (inv.status === 'Betaald') {
-            stats.betaaldDitJaar += inv.total || 0;
-            stats.omzetExclBtw += inv.subtotal || 0;
-            stats.btwTeBetalen += inv.vat_total || 0;
+            stats.betaaldDitJaar += inv.total    || 0;
+            stats.omzetExclBtw   += inv.subtotal || 0;
+            stats.btwTeBetalen   += inv.vat_total || 0;
           }
         });
+        costsRows.forEach(c => {
+          stats.kostenExclBtw    += c.bedrag_excl_btw || 0;
+          stats.btwVoorbelasting += c.btw_bedrag      || 0;
+        });
+        stats.btwTeBetalen -= stats.btwVoorbelasting;
+        stats.nettoWinst    = stats.omzetExclBtw - stats.kostenExclBtw;
+
         return jsonResponse({ invoices, stats }, 200, request);
       }
 
@@ -633,8 +644,6 @@ export default {
       // ==========================================
       // --- FACTUREN ---
       // ==========================================
-
-      // Lijst / aanmaken
       if (path === "/api/invoices") {
         if (request.method === "POST") {
           if (!userRecord.plan_factuur) {
@@ -644,7 +653,7 @@ export default {
             }
           }
           const inv = await request.json();
-          const invId = crypto.randomUUID();
+          const invId   = crypto.randomUUID();
           const dueDate = inv.due_date || inv.issue_date;
           await env.DB.prepare(`
             INSERT INTO invoices (id, user_id, invoice_number, issue_date, due_date, status,
@@ -662,7 +671,13 @@ export default {
         }
       }
 
-      // Enkelvoudige factuur — lezen, bewerken, verwijderen
+      // Kwartaal reset
+      if (path === "/api/invoices/reset" && request.method === "POST") {
+        if (!userRecord.plan_factuur) return jsonResponse({ error: 'Premium vereist' }, 403, request);
+        await env.DB.prepare('DELETE FROM invoices WHERE user_id = ?').bind(userId).run();
+        return jsonResponse({ message: 'Alle factuurdata verwijderd' }, 200, request);
+      }
+
       if (path.match(/^\/api\/invoices\/[^/]+$/) && !path.endsWith('/status')) {
         const invoiceId = path.split("/")[3];
 
@@ -673,10 +688,8 @@ export default {
         }
 
         if (request.method === "PUT") {
-          if (!userRecord.plan_factuur) {
-            return jsonResponse({ error: 'Premium vereist om facturen te bewerken.' }, 403, request);
-          }
-          const inv = await request.json();
+          if (!userRecord.plan_factuur) return jsonResponse({ error: 'Premium vereist om facturen te bewerken.' }, 403, request);
+          const inv     = await request.json();
           const dueDate = inv.due_date || inv.issue_date;
           await env.DB.prepare(`
             UPDATE invoices SET
@@ -696,17 +709,14 @@ export default {
         }
 
         if (request.method === "DELETE") {
-          if (!userRecord.plan_factuur) {
-            return jsonResponse({ error: 'Premium vereist om facturen te verwijderen.' }, 403, request);
-          }
+          if (!userRecord.plan_factuur) return jsonResponse({ error: 'Premium vereist om facturen te verwijderen.' }, 403, request);
           await env.DB.prepare('DELETE FROM invoices WHERE id = ? AND user_id = ?').bind(invoiceId, userId).run();
           return jsonResponse({ message: 'Factuur verwijderd' }, 200, request);
         }
       }
 
-      // Status updaten
       if (request.method === "PUT" && path.match(/^\/api\/invoices\/[^/]+\/status$/)) {
-        const invoiceId = path.split("/")[3];
+        const invoiceId    = path.split("/")[3];
         const { status } = await request.json();
         const validStatuses = ['Offerte', 'Openstaand', 'Betaald', 'Verlopen'];
         if (!validStatuses.includes(status)) return jsonResponse({ error: 'Ongeldige status' }, 400, request);
@@ -715,7 +725,46 @@ export default {
       }
 
       // ==========================================
-      // 3. PLANNER ROUTES (Protected by Auth)
+      // --- KOSTEN ---
+      // ==========================================
+      if (path === "/api/costs") {
+        if (request.method === "GET") {
+          const year  = url.searchParams.get('year');
+          const month = url.searchParams.get('month');
+          let query = 'SELECT * FROM costs WHERE user_id = ?';
+          const params: any[] = [userId];
+          if (year) { query += ' AND datum LIKE ?'; params.push(`${year}-%`); }
+          if (month) { query += ' AND datum LIKE ?'; params.push(`%-${month.padStart(2,'0')}-%`); }
+          query += ' ORDER BY datum DESC';
+          const { results } = await env.DB.prepare(query).bind(...params).all();
+          return jsonResponse({ costs: results }, 200, request);
+        }
+        if (request.method === "POST") {
+          const data = await request.json();
+          if (!data.omschrijving?.trim()) return jsonResponse({ error: 'Omschrijving is verplicht' }, 400, request);
+          if (!data.bedrag_incl_btw || data.bedrag_incl_btw <= 0) return jsonResponse({ error: 'Bedrag is verplicht' }, 400, request);
+          const btwPct       = parseFloat(data.btw_percentage) || 21;
+          const inclBtw      = parseFloat(data.bedrag_incl_btw);
+          const exclBtw      = inclBtw / (1 + btwPct / 100);
+          const btwBedrag    = inclBtw - exclBtw;
+          const id           = crypto.randomUUID();
+          await env.DB.prepare(`
+            INSERT INTO costs (id, user_id, omschrijving, bedrag_incl_btw, btw_percentage, bedrag_excl_btw, btw_bedrag, datum, categorie)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(id, userId, data.omschrijving.trim(), inclBtw, btwPct, exclBtw, btwBedrag,
+                  data.datum || new Date().toISOString().split('T')[0], data.categorie || null).run();
+          return jsonResponse({ message: 'Kosten opgeslagen', id, bedrag_excl_btw: exclBtw, btw_bedrag: btwBedrag }, 200, request);
+        }
+      }
+
+      if (path.match(/^\/api\/costs\/[^/]+$/) && request.method === "DELETE") {
+        const costId = path.split("/")[3];
+        await env.DB.prepare('DELETE FROM costs WHERE id = ? AND user_id = ?').bind(costId, userId).run();
+        return jsonResponse({ message: 'Kosten verwijderd' }, 200, request);
+      }
+
+      // ==========================================
+      // 3. PLANNER ROUTES
       // ==========================================
       if (path.startsWith('/api/planner/')) {
         const isPlannerPremium = Boolean(userRecord.plan_planner);
@@ -723,23 +772,20 @@ export default {
         // ── SERVICES ──────────────────────────────────────────────
         if (path === '/api/planner/services') {
           if (request.method === 'GET') {
-            const { results } = await env.DB.prepare(
-              'SELECT * FROM planner_services WHERE user_id = ? ORDER BY naam ASC'
-            ).bind(userId).all();
+            const { results } = await env.DB.prepare('SELECT * FROM planner_services WHERE user_id = ? ORDER BY naam ASC').bind(userId).all();
             return jsonResponse({ services: results }, 200, request);
           }
           if (request.method === 'POST') {
             const data = await request.json();
             if (!data.naam?.trim()) return jsonResponse({ error: 'Naam is verplicht' }, 400, request);
-            // Gratis: max 1 dienst
             if (!isPlannerPremium) {
               const count = await env.DB.prepare('SELECT COUNT(*) as c FROM planner_services WHERE user_id = ?').bind(userId).first();
               if ((count?.c || 0) >= 1) return jsonResponse({ error: 'Max 1 dienst op gratis account.', upgrade: true }, 403, request);
             }
             const id = crypto.randomUUID();
             await env.DB.prepare(
-              'INSERT INTO planner_services (id, user_id, naam, duur_in_minuten, prijs, kleur, beschrijving) VALUES (?, ?, ?, ?, ?, ?, ?)'
-            ).bind(id, userId, data.naam.trim(), data.duur_in_minuten || 60, data.prijs || 0, data.kleur || '#4f46e5', data.beschrijving || null).run();
+              'INSERT INTO planner_services (id, user_id, naam, duur_in_minuten, prijs, kleur, beschrijving, location_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            ).bind(id, userId, data.naam.trim(), data.duur_in_minuten || 60, data.prijs || 0, data.kleur || '#4f46e5', data.beschrijving || null, data.location_id || null).run();
             return jsonResponse({ message: 'Dienst opgeslagen', id }, 200, request);
           }
         }
@@ -753,9 +799,7 @@ export default {
         // ── STAFF ─────────────────────────────────────────────────
         if (path === '/api/planner/staff') {
           if (request.method === 'GET') {
-            const { results } = await env.DB.prepare(
-              'SELECT * FROM planner_staff WHERE user_id = ? ORDER BY naam ASC'
-            ).bind(userId).all();
+            const { results } = await env.DB.prepare('SELECT * FROM planner_staff WHERE user_id = ? ORDER BY naam ASC').bind(userId).all();
             return jsonResponse({ staff: results }, 200, request);
           }
           if (request.method === 'POST') {
@@ -766,9 +810,7 @@ export default {
               if ((count?.c || 0) >= 1) return jsonResponse({ error: 'Max 1 medewerker op gratis account.', upgrade: true }, 403, request);
             }
             const id = crypto.randomUUID();
-            await env.DB.prepare(
-              'INSERT INTO planner_staff (id, user_id, naam, functie, kleur) VALUES (?, ?, ?, ?, ?)'
-            ).bind(id, userId, data.naam.trim(), data.functie || null, data.kleur || '#06b6d4').run();
+            await env.DB.prepare('INSERT INTO planner_staff (id, user_id, naam, functie, kleur) VALUES (?, ?, ?, ?, ?)').bind(id, userId, data.naam.trim(), data.functie || null, data.kleur || '#06b6d4').run();
             return jsonResponse({ message: 'Medewerker toegevoegd', id }, 200, request);
           }
         }
@@ -777,6 +819,27 @@ export default {
           const id = path.split('/')[4];
           await env.DB.prepare('DELETE FROM planner_staff WHERE id = ? AND user_id = ?').bind(id, userId).run();
           return jsonResponse({ message: 'Medewerker verwijderd' }, 200, request);
+        }
+
+        // ── LOCATIONS ─────────────────────────────────────────────
+        if (path === '/api/planner/locations') {
+          if (request.method === 'GET') {
+            const { results } = await env.DB.prepare('SELECT * FROM planner_locations WHERE user_id = ? ORDER BY naam ASC').bind(userId).all();
+            return jsonResponse({ locations: results }, 200, request);
+          }
+          if (request.method === 'POST') {
+            const data = await request.json();
+            if (!data.naam?.trim()) return jsonResponse({ error: 'Naam is verplicht' }, 400, request);
+            const id = crypto.randomUUID();
+            await env.DB.prepare('INSERT INTO planner_locations (id, user_id, naam, adres, stad, kleur) VALUES (?, ?, ?, ?, ?, ?)').bind(id, userId, data.naam.trim(), data.adres || null, data.stad || null, data.kleur || '#4f46e5').run();
+            return jsonResponse({ message: 'Locatie opgeslagen', id }, 200, request);
+          }
+        }
+
+        if (path.match(/^\/api\/planner\/locations\/[^/]+$/) && request.method === 'DELETE') {
+          const id = path.split('/')[4];
+          await env.DB.prepare('DELETE FROM planner_locations WHERE id = ? AND user_id = ?').bind(id, userId).run();
+          return jsonResponse({ message: 'Locatie verwijderd' }, 200, request);
         }
 
         // ── APPOINTMENTS ──────────────────────────────────────────
@@ -794,21 +857,20 @@ export default {
             if (!data.service_id || !data.klant_naam?.trim() || !data.datum || !data.start_tijd) {
               return jsonResponse({ error: 'service_id, klant_naam, datum en start_tijd zijn verplicht' }, 400, request);
             }
-            // Bereken eind_tijd op basis van service duur
             const svc = await env.DB.prepare('SELECT duur_in_minuten, naam, kleur FROM planner_services WHERE id = ? AND user_id = ?').bind(data.service_id, userId).first();
             const stf = data.staff_id ? await env.DB.prepare('SELECT naam FROM planner_staff WHERE id = ? AND user_id = ?').bind(data.staff_id, userId).first() : null;
-            const [h, m] = (data.start_tijd || '09:00').split(':').map(Number);
-            const endMin = h * 60 + m + (svc?.duur_in_minuten || 60);
+            const [h, m]   = (data.start_tijd || '09:00').split(':').map(Number);
+            const endMin   = h * 60 + m + (svc?.duur_in_minuten || 60);
             const eind_tijd = `${String(Math.floor(endMin / 60)).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`;
-            const id = crypto.randomUUID();
+            const id    = crypto.randomUUID();
             const token = crypto.randomUUID();
             await env.DB.prepare(`
               INSERT INTO planner_appointments
-                (id, user_id, service_id, staff_id, klant_naam, klant_email, klant_telefoon, datum, start_tijd, eind_tijd,
+                (id, user_id, service_id, staff_id, location_id, klant_naam, klant_email, klant_telefoon, datum, start_tijd, eind_tijd,
                  service_naam, service_kleur, staff_naam, status, notitie, cancellation_token)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bevestigd', ?, ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bevestigd', ?, ?)
             `).bind(
-              id, userId, data.service_id, data.staff_id || null,
+              id, userId, data.service_id, data.staff_id || null, data.location_id || null,
               data.klant_naam.trim(), data.klant_email || null, data.klant_telefoon || null,
               data.datum, data.start_tijd, eind_tijd,
               svc?.naam || '', svc?.kleur || '#4f46e5', stf?.naam || null,
@@ -845,16 +907,10 @@ export default {
           }
           if (request.method === 'POST') {
             const data = await request.json();
-            if (!data.datum || !data.start_tijd || !data.eind_tijd) {
-              return jsonResponse({ error: 'datum, start_tijd en eind_tijd zijn verplicht' }, 400, request);
-            }
-            if (data.start_tijd >= data.eind_tijd) {
-              return jsonResponse({ error: 'Starttijd moet vóór eindtijd liggen' }, 400, request);
-            }
+            if (!data.datum || !data.start_tijd || !data.eind_tijd) return jsonResponse({ error: 'datum, start_tijd en eind_tijd zijn verplicht' }, 400, request);
+            if (data.start_tijd >= data.eind_tijd) return jsonResponse({ error: 'Starttijd moet vóór eindtijd liggen' }, 400, request);
             const id = crypto.randomUUID();
-            await env.DB.prepare(
-              'INSERT INTO planner_timeslots (id, user_id, datum, start_tijd, eind_tijd, staff_id) VALUES (?, ?, ?, ?, ?, ?)'
-            ).bind(id, userId, data.datum, data.start_tijd, data.eind_tijd, data.staff_id || null).run();
+            await env.DB.prepare('INSERT INTO planner_timeslots (id, user_id, datum, start_tijd, eind_tijd, staff_id) VALUES (?, ?, ?, ?, ?, ?)').bind(id, userId, data.datum, data.start_tijd, data.eind_tijd, data.staff_id || null).run();
             return jsonResponse({ message: 'Tijdslot toegevoegd', id }, 200, request);
           }
         }
@@ -869,20 +925,13 @@ export default {
         if (path === '/api/planner/settings') {
           if (request.method === 'GET') {
             const settings = await env.DB.prepare('SELECT * FROM planner_settings WHERE user_id = ?').bind(userId).first() || {};
-            const { results: availabilities } = await env.DB.prepare(
-              'SELECT * FROM planner_availabilities WHERE user_id = ? ORDER BY dag_van_de_week ASC'
-            ).bind(userId).all();
+            const { results: availabilities } = await env.DB.prepare('SELECT * FROM planner_availabilities WHERE user_id = ? ORDER BY dag_van_de_week ASC').bind(userId).all();
             return jsonResponse({ settings, availabilities }, 200, request);
           }
           if (request.method === 'PUT') {
             const data = await request.json();
-            if (!data.publieke_url_slug?.trim()) {
-              return jsonResponse({ error: 'URL slug is verplicht' }, 400, request);
-            }
-            // Slug uniciteit controleren (andere users)
-            const slugCheck = await env.DB.prepare(
-              'SELECT user_id FROM planner_settings WHERE publieke_url_slug = ? AND user_id != ?'
-            ).bind(data.publieke_url_slug.trim(), userId).first();
+            if (!data.publieke_url_slug?.trim()) return jsonResponse({ error: 'URL slug is verplicht' }, 400, request);
+            const slugCheck = await env.DB.prepare('SELECT user_id FROM planner_settings WHERE publieke_url_slug = ? AND user_id != ?').bind(data.publieke_url_slug.trim(), userId).first();
             if (slugCheck) return jsonResponse({ error: 'Deze URL slug is al in gebruik' }, 409, request);
 
             await env.DB.prepare(`
@@ -899,11 +948,10 @@ export default {
             `).bind(
               userId, data.publieke_url_slug.trim(), data.bedrijfs_naam || null,
               data.bedrijfs_beschrijving || null, data.slot_interval || 15,
-              data.availability_mode || 'recurring', data.max_days_vooruit || 30,
+              data.availability_mode || 'custom_slots', data.max_days_vooruit || 30,
               data.google_calendar_enabled ? 1 : 0
             ).run();
 
-            // Beschikbaarheden opslaan
             if (Array.isArray(data.availabilities)) {
               await env.DB.prepare('DELETE FROM planner_availabilities WHERE user_id = ?').bind(userId).run();
               for (const avail of data.availabilities) {
@@ -912,7 +960,6 @@ export default {
                 ).bind(crypto.randomUUID(), userId, avail.dag_van_de_week, avail.start_tijd, avail.eind_tijd, avail.is_beschikbaar ? 1 : 0).run();
               }
             }
-
             return jsonResponse({ message: 'Planner instellingen opgeslagen' }, 200, request);
           }
         }
@@ -920,7 +967,7 @@ export default {
         // ── GOOGLE CALENDAR (stub) ────────────────────────────────
         if (path === '/api/planner/google/auth-url' && request.method === 'GET') {
           if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
-            return jsonResponse({ error: 'Google Calendar is niet geconfigureerd op deze server.' }, 501, request);
+            return jsonResponse({ error: 'Google Calendar is niet geconfigureerd.' }, 501, request);
           }
           const redirectUri = `${url.origin}/api/planner/google/callback`;
           const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${env.GOOGLE_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=https://www.googleapis.com/auth/calendar&access_type=offline&prompt=consent&state=${userId}`;
@@ -928,9 +975,7 @@ export default {
         }
 
         if (path === '/api/planner/google/disconnect' && request.method === 'POST') {
-          await env.DB.prepare(
-            'UPDATE planner_settings SET google_calendar_enabled=0, google_access_token=NULL, google_refresh_token=NULL WHERE user_id=?'
-          ).bind(userId).run();
+          await env.DB.prepare('UPDATE planner_settings SET google_calendar_enabled=0, google_access_token=NULL, google_refresh_token=NULL WHERE user_id=?').bind(userId).run();
           return jsonResponse({ message: 'Google Calendar ontkoppeld' }, 200, request);
         }
 
